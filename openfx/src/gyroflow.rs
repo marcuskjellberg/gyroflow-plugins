@@ -112,6 +112,8 @@ struct InstanceData {
     supports_output_size: bool,
     is_fusion_page: bool,
     file_path: Option<String>,
+    /// Last logged (start_ms, end_ms) trim detection, to avoid log spam
+    last_trim_log: Option<(i64, i64)>,
 
     current_file_info_pending: Arc<AtomicBool>,
     current_file_info: Arc<Mutex<Option<CurrentFileInfo>>>,
@@ -247,6 +249,11 @@ impl Execute for GyroflowPlugin {
                         let start_ms = (offset_frames / fps * 1000.0).max(0.0);
                         let end_ms = ((offset_frames + clip_len_frames) / fps * 1000.0).min(duration_ms);
                         if end_ms > start_ms {
+                            let log_key = (start_ms.round() as i64, end_ms.round() as i64);
+                            if instance_data.last_trim_log != Some(log_key) {
+                                instance_data.last_trim_log = Some(log_key);
+                                log::info!("Trim detected: src_frame: {src_frame:?}, frame_range: {frame_range:?}, time: {time}, offset_frames: {offset_frames:.1}, clip: {:.0}-{:.0} ms of {duration_ms:.0} ms", start_ms, end_ms);
+                            }
                             // The host-reported range jitters by a frame or two between renders
                             // (and between Resolve's internal instances of the same clip) — only
                             // re-solve the zoom when the range moved further than that
@@ -264,6 +271,9 @@ impl Execute for GyroflowPlugin {
                             }
                         }
                     }
+                } else if instance_data.last_trim_log.is_none() {
+                    instance_data.last_trim_log = Some((-1, -1));
+                    log::info!("Trim detection unavailable: src_frame: {src_frame:?}, frame_range: {frame_range:?}, duration_ms: {duration_ms:.0}");
                 }
                 let source_image = if in_args.get_opengl_enabled().unwrap_or_default() {
                     instance_data.source_clip.load_texture(time, None)?
@@ -447,6 +457,7 @@ impl Execute for GyroflowPlugin {
                     supports_output_size: true,
                     is_fusion_page: false,
                     file_path: None,
+                    last_trim_log: None,
                     params: ParamHandler {
                         instance_id:              param_set.parameter("InstanceId")?,
                         project_data:             param_set.parameter("ProjectData")?,
@@ -530,6 +541,25 @@ impl Execute for GyroflowPlugin {
                 if let Ok(path) = props.get_src_file_path() {
                     if !path.is_empty() {
                         instance_data.file_path = Some(path.clone());
+                        if !instance_data.supports_output_size {
+                            // Read the video dimensions right away: Resolve queries the output
+                            // RoD before the first render, and it must already report the
+                            // source's natural size at that point
+                            let url = filesystem::path_to_url(&path);
+                            if let Ok(mut file) = filesystem::open_file(&url, false, false) {
+                                let filesize = file.size;
+                                if let Ok(md) = gyroflow_core::util::get_video_metadata(file.get_file(), filesize, &url) {
+                                    let mut size = (md.width as usize, md.height as usize);
+                                    if md.rotation.abs() == 90 || md.rotation.abs() == 270 {
+                                        size = (size.1, size.0);
+                                    }
+                                    if size.0 > 0 && size.1 > 0 {
+                                        log::info!("CreateInstance: source video size: {size:?}, rotation: {}", md.rotation);
+                                        instance_data.plugin.original_video_size = size;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -582,6 +612,7 @@ impl Execute for GyroflowPlugin {
                         out_rod.x2 = video_size.0 as f64;
                         out_rod.y2 = video_size.1 as f64;
                     }
+                    log::debug!("GetRegionOfDefinition: time: {time}, source rod: {:?}, returning: {:?}", (rod.x1, rod.y1, rod.x2, rod.y2), (out_rod.x1, out_rod.y1, out_rod.x2, out_rod.y2));
                     out_args.set_effect_region_of_definition(out_rod)?;
                     return OK;
                 }
