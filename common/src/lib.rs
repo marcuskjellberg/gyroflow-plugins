@@ -1276,3 +1276,46 @@ macro_rules! define_params {
         }
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_to_aspect_wider_source_into_taller_bounds() {
+        // 5312x2988 (16:9) source into a 4000x3000 (4:3) timeline
+        assert_eq!(GyroflowPluginBase::fit_to_aspect((4000, 3000), (5312, 2988)), (4000, 2250));
+    }
+
+    #[test]
+    fn fit_to_aspect_taller_source_into_wider_bounds() {
+        // Portrait 1080x1920 source into a 1920x1080 timeline
+        assert_eq!(GyroflowPluginBase::fit_to_aspect((1920, 1080), (1080, 1920)), (608, 1080));
+    }
+
+    #[test]
+    fn fit_to_aspect_matching_ratio_is_identity() {
+        assert_eq!(GyroflowPluginBase::fit_to_aspect((3840, 2160), (1920, 1080)), (3840, 2160));
+    }
+
+    #[test]
+    fn fit_to_aspect_zero_safety() {
+        assert_eq!(GyroflowPluginBase::fit_to_aspect((0, 0), (1920, 1080)), (0, 0));
+        assert_eq!(GyroflowPluginBase::fit_to_aspect((1920, 1080), (0, 0)), (1920, 1080));
+    }
+
+    #[test]
+    fn center_rect_composes_with_fitted_output() {
+        // The auto out_rect for the same 5312x2988-in-4000x3000 case:
+        // fitted stabilizer output is 4000x2250, centered in the 4000x3000 buffer
+        let fitted = GyroflowPluginBase::fit_to_aspect((4000, 3000), (5312, 2988));
+        let ratio = fitted.0 as f64 / fitted.1 as f64;
+        assert_eq!(GyroflowPluginBase::get_center_rect(4000, 3000, ratio), (0, 375, 4000, 2250));
+    }
+
+    #[test]
+    fn center_rect_close_ratio_is_full_rect() {
+        // Within the 0.1 ratio threshold -> no letterboxing
+        assert_eq!(GyroflowPluginBase::get_center_rect(1920, 1080, 1.8), (0, 0, 1920, 1080));
+    }
+}

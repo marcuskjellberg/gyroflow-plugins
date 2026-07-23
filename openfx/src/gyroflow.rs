@@ -209,23 +209,6 @@ impl Execute for GyroflowPlugin {
                     (md.has_accurate_timestamps, !gyro.get_offsets().is_empty())
                 };
 
-                let mut speed_stretch = 1.0;
-                let mut time_adj = 0.0;
-                if let Ok(range) = instance_data.source_clip.get_frame_range() {
-                    if instance_data.is_fusion_page {
-                        time_adj = range.min;
-                    }
-                    if range.max > 0.0 && !instance_data.is_fusion_page {
-                        let duration_at_src_fps = (range.max / src_fps) * 1000.0;
-                        speed_stretch = ((params.duration_ms.round() / duration_at_src_fps.round()) * 100.0).floor() / 100.0;
-                    }
-                }
-
-                // This should cover most cases by default, and for the rest users will use Fusion
-                if speed_stretch == 1.01 || speed_stretch == 0.99 || speed_stretch == 1.02 || speed_stretch == 0.98 || speed_stretch == 1.03 || speed_stretch == 0.97 {
-                    speed_stretch = 1.0;
-                }
-
                 if (src_fps - fps).abs() > 0.01 {
                     instance_data.plugin.set_status(&mut instance_data.params, "Timeline fps mismatch!", "Timeline frame rate doesn't match the clip frame rate! Use the plugin in Fusion instead", false);
                 } else if !has_accurate_timestamps && !has_offsets {
@@ -234,34 +217,53 @@ impl Execute for GyroflowPlugin {
                     instance_data.plugin.set_status(&mut instance_data.params, "OK", "OK", true);
                 }
 
-                let mut time = time;
-                //let time_adj = if instance_data.is_fusion_page { instance_data.params.fusion_start_frame.get_value().unwrap_or_default() } else { 0.0 };
-                time -= time_adj;
-                let mut timestamp_us = ((time / src_fps * 1_000_000.0) * speed_stretch).round() as i64;
+                let frame_range = instance_data.source_clip.get_frame_range().ok().map(|r| (r.min, r.max));
+                let src_frame = in_args.get_src_frame().ok().map(|f| f as i64);
+                let duration_ms = params.duration_ms;
 
-                // log::info!("fps: {fps:?}, src_fps: {src_fps:?}, speed_stretch: {speed_stretch:.6}, time: {time:?}, timestamp_us: {timestamp_us:?}");
-
-                if (src_fps - fps).abs() > 0.01 {
-                    let frame = (time / src_fps) * fps * speed_stretch;
-                    timestamp_us = (frame.floor() * (1_000_000.0 / fps)).round() as i64;
-                }
-                if let Ok(frame) = in_args.get_src_frame() {
-                    timestamp_us = (frame as f64 * (1_000_000.0 / fps)).round() as i64;
-                }
-
-                let source_timestamp_us = params.get_source_timestamp_at_ramped_timestamp(timestamp_us);
+                let computed = crate::timestamp::compute_timestamp(&crate::timestamp::TimeParams {
+                    time,
+                    frame_range,
+                    src_fps,
+                    fps,
+                    duration_ms,
+                    src_frame,
+                    is_fusion_page: instance_data.is_fusion_page,
+                }, |ts| params.get_source_timestamp_at_ramped_timestamp(ts));
                 drop(params);
 
-                if source_timestamp_us != timestamp_us {
-                    time = (source_timestamp_us as f64 / speed_stretch / 1_000_000.0 * src_fps).round();
-                    timestamp_us = ((time / src_fps * 1_000_000.0) * speed_stretch).round() as i64;
-                    if (src_fps - fps).abs() > 0.01 {
-                        let frame = (time / src_fps) * fps * speed_stretch;
-                        timestamp_us = (frame.floor() * (1_000_000.0 / fps)).round() as i64;
+                let time = computed.fetch_time;
+                let timestamp_us = computed.timestamp_us;
+
+                // log::info!("fps: {fps:?}, src_fps: {src_fps:?}, speed_stretch: {:.6}, time: {time:?}, timestamp_us: {timestamp_us:?}, frame_range: {frame_range:?}, src_frame: {src_frame:?}, trim_offset: {:?}", computed.speed_stretch, computed.trim_offset_frames);
+
+                // Feed the detected trim into gyroflow-core, so that adaptive zoom is solved
+                // over the visible sub-clip instead of the whole source recording
+                if let (Some(offset_frames), Some((range_min, range_max))) = (computed.trim_offset_frames, frame_range) {
+                    if duration_ms > 0.0 && fps > 0.0 && src_fps > 0.0 {
+                        let clip_len_frames = ((range_max - range_min) * (fps / src_fps)).max(0.0);
+                        let start_ms = (offset_frames / fps * 1000.0).max(0.0);
+                        let end_ms = ((offset_frames + clip_len_frames) / fps * 1000.0).min(duration_ms);
+                        if end_ms > start_ms {
+                            let current = stab.trim_ranges().first().cloned();
+                            // Managers can be shared between multiple pieces of the same clip:
+                            // apply the union of all requested ranges so the pieces don't fight
+                            let union_ms = match current {
+                                Some((s, e)) => ((s * duration_ms).min(start_ms), (e * duration_ms).max(end_ms)),
+                                None => (start_ms, end_ms),
+                            };
+                            let changed = match current {
+                                Some((s, e)) => ((s * duration_ms).round() as i64, (e * duration_ms).round() as i64) != (union_ms.0.round() as i64, union_ms.1.round() as i64),
+                                None => !(union_ms.0 <= 0.0 && union_ms.1 >= duration_ms), // full range == no trim
+                            };
+                            if changed {
+                                log::info!("Setting trim range: {union_ms:?} ms of {duration_ms:?} ms");
+                                stab.set_trim_ranges(vec![(union_ms.0 / duration_ms, union_ms.1 / duration_ms)]);
+                                stab.invalidate_blocking_smoothing();
+                            }
+                        }
                     }
                 }
-
-                time += time_adj;
                 let source_image = if in_args.get_opengl_enabled().unwrap_or_default() {
                     instance_data.source_clip.load_texture(time, None)?
                 } else {
