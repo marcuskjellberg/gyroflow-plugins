@@ -15,6 +15,7 @@ gyroflow-plugin-base = { path = "../common" }
 ofx = "0.3"
 log = "0.4"
 regex = "1.12"
+fastrand = "2.4"
 
 [build-dependencies]
 winres = "0.1"

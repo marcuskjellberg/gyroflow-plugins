@@ -17,6 +17,10 @@ plugin_module!(
 #[derive(Default)]
 struct GyroflowPlugin {
     gyroflow_plugin: GyroflowPluginBase,
+    /// Trim ranges (start_ms, end_ms) requested per manager cache key, by live instance.
+    /// Managers can be shared between multiple pieces of the same clip, so the applied
+    /// range is the union of what all live instances requested.
+    trim_requests: Mutex<std::collections::HashMap<String, std::collections::HashMap<u64, (f64, f64)>>>,
 }
 
 pub fn frame_from_timetype(time: TimeType) -> f64 {
@@ -112,6 +116,12 @@ struct InstanceData {
     supports_output_size: bool,
     is_fusion_page: bool,
     file_path: Option<String>,
+    /// Unique per OFX instance (unlike the InstanceId param, which is shared between
+    /// pieces of the same cut clip). Keys this instance's entry in `trim_requests`.
+    instance_token: u64,
+    /// Last accepted (start_ms, end_ms) trim, with hysteresis against per-render jitter
+    /// in the host-reported frame range
+    accepted_trim: Option<(f64, f64)>,
 
     current_file_info_pending: Arc<AtomicBool>,
     current_file_info: Arc<Mutex<Option<CurrentFileInfo>>>,
@@ -238,28 +248,46 @@ impl Execute for GyroflowPlugin {
                 // log::info!("fps: {fps:?}, src_fps: {src_fps:?}, speed_stretch: {:.6}, time: {time:?}, timestamp_us: {timestamp_us:?}, frame_range: {frame_range:?}, src_frame: {src_frame:?}, trim_offset: {:?}", computed.speed_stretch, computed.trim_offset_frames);
 
                 // Feed the detected trim into gyroflow-core, so that adaptive zoom is solved
-                // over the visible sub-clip instead of the whole source recording
+                // over the visible sub-clip instead of the whole source recording.
+                // Re-trimming the clip re-solves the zoom over the new range (shrinking too),
+                // just like changing the trim in the Gyroflow app.
                 if let (Some(offset_frames), Some((range_min, range_max))) = (computed.trim_offset_frames, frame_range) {
                     if duration_ms > 0.0 && fps > 0.0 && src_fps > 0.0 {
                         let clip_len_frames = ((range_max - range_min) * (fps / src_fps)).max(0.0);
                         let start_ms = (offset_frames / fps * 1000.0).max(0.0);
                         let end_ms = ((offset_frames + clip_len_frames) / fps * 1000.0).min(duration_ms);
                         if end_ms > start_ms {
-                            let current = stab.trim_ranges().first().cloned();
-                            // Managers can be shared between multiple pieces of the same clip:
-                            // apply the union of all requested ranges so the pieces don't fight
-                            let union_ms = match current {
-                                Some((s, e)) => ((s * duration_ms).min(start_ms), (e * duration_ms).max(end_ms)),
-                                None => (start_ms, end_ms),
+                            // The host-reported range jitters by a frame or two between renders —
+                            // only accept a change bigger than that, so the zoom isn't re-solved needlessly
+                            let tolerance_ms = 3.0 * 1000.0 / fps;
+                            let detected = (start_ms, end_ms);
+                            let accepted = match instance_data.accepted_trim {
+                                Some(acc) if (acc.0 - detected.0).abs() < tolerance_ms && (acc.1 - detected.1).abs() < tolerance_ms => acc,
+                                _ => { instance_data.accepted_trim = Some(detected); detected }
                             };
-                            let changed = match current {
-                                Some((s, e)) => ((s * duration_ms).round() as i64, (e * duration_ms).round() as i64) != (union_ms.0.round() as i64, union_ms.1.round() as i64),
-                                None => !(union_ms.0 <= 0.0 && union_ms.1 >= duration_ms), // full range == no trim
-                            };
-                            if changed {
-                                log::info!("Setting trim range: {union_ms:?} ms of {duration_ms:?} ms");
-                                stab.set_trim_ranges(vec![(union_ms.0 / duration_ms, union_ms.1 / duration_ms)]);
-                                stab.invalidate_blocking_smoothing();
+                            if let Some(key) = GyroflowPluginBase::manager_cache_key(&instance_data.params) {
+                                // Managers can be shared between multiple pieces of the same clip:
+                                // solve the zoom over the union of the ranges requested by all live
+                                // instances, so the pieces don't fight over the manager, while
+                                // re-trimming a single clip can still shrink the range
+                                let union = {
+                                    let mut lock = self.trim_requests.lock();
+                                    let entry = lock.entry(key).or_default();
+                                    entry.insert(instance_data.instance_token, accepted);
+                                    entry.values().fold((f64::MAX, f64::MIN), |a, v| (a.0.min(v.0), a.1.max(v.1)))
+                                };
+                                // A union covering (nearly) the whole clip means no trim at all
+                                let new_range = if union.0 <= tolerance_ms && union.1 >= duration_ms - tolerance_ms {
+                                    (0.0, 1.0)
+                                } else {
+                                    (union.0 / duration_ms, union.1 / duration_ms)
+                                };
+                                let current = stab.trim_ranges().first().cloned().unwrap_or((0.0, 1.0));
+                                if ((current.0 - new_range.0) * duration_ms).abs() > 1.0 || ((current.1 - new_range.1) * duration_ms).abs() > 1.0 {
+                                    log::info!("Setting trim range: {:?} ms of {duration_ms:?} ms", (new_range.0 * duration_ms, new_range.1 * duration_ms));
+                                    stab.set_trim_ranges(vec![new_range]);
+                                    stab.invalidate_blocking_smoothing();
+                                }
                             }
                         }
                     }
@@ -446,6 +474,8 @@ impl Execute for GyroflowPlugin {
                     supports_output_size: true,
                     is_fusion_page: false,
                     file_path: None,
+                    instance_token: fastrand::u64(..),
+                    accepted_trim: None,
                     params: ParamHandler {
                         instance_id:              param_set.parameter("InstanceId")?,
                         project_data:             param_set.parameter("ProjectData")?,
@@ -502,7 +532,7 @@ impl Execute for GyroflowPlugin {
                         framebuffer_inverted:        true,
                         anamorphic_adjust_size:      true,
                         always_set_input_rotation:   false,
-                        fit_output_size_to_source_ar: false,
+                        force_source_output_size:    false,
                         has_motion:                  false,
                         keyframable_params: Arc::new(RwLock::new(KeyframableParams {
                             use_gyroflows_keyframes: param_set.parameter::<Bool>("UseGyroflowsKeyframes")?.get_value()?,
@@ -519,9 +549,9 @@ impl Execute for GyroflowPlugin {
                 let props: EffectInstance = effect.properties()?;
                 if matches!(props.get_resolve_page().as_deref(), Ok("Edit") | Ok("Color")) {
                     instance_data.supports_output_size = false;
-                    // These pages force the output to the timeline size: fit the default
-                    // output size to the source aspect ratio so the image is never stretched
-                    instance_data.plugin.fit_output_size_to_source_ar = true;
+                    // On these pages the plugin should behave like a native clip: output at
+                    // the source's natural size and let Resolve do all scaling/framing
+                    instance_data.plugin.force_source_output_size = true;
                 }
                 if matches!(props.get_resolve_page().as_deref(), Ok("Fusion")) {
                     instance_data.is_fusion_page = true;
@@ -567,6 +597,13 @@ impl Execute for GyroflowPlugin {
                 let time = in_args.get_time()?;
                 let instance_data = effect.get_instance_data::<InstanceData>()?;
                 let rod = instance_data.source_clip.get_region_of_definition(time)?;
+                if !instance_data.supports_output_size {
+                    // Resolve Edit/Color pages: output at the source clip's natural size so the
+                    // host composes and scales the clip exactly like an unstabilized one — no
+                    // stretched image and no baked-in letterbox/pillarbox bars
+                    out_args.set_effect_region_of_definition(rod)?;
+                    return OK;
+                }
                 let mut out_rod = rod;
                 if instance_data.plugin.original_output_size != (0, 0) && !instance_data.params.get_bool_at_time(Params::DontDrawOutside, TimeType::Frame(time)).unwrap() { // TODO: unwrap
                     out_rod.x2 = instance_data.plugin.original_output_size.0 as f64;
@@ -580,7 +617,11 @@ impl Execute for GyroflowPlugin {
             }
 
             DestroyInstance(ref mut effect) => {
-                effect.get_instance_data::<InstanceData>()?.plugin.clear_stab(&self.gyroflow_plugin.manager_cache);
+                let instance_data = effect.get_instance_data::<InstanceData>()?;
+                // Remove this instance's trim request so it no longer contributes to the union
+                let token = instance_data.instance_token;
+                self.trim_requests.lock().retain(|_, m| { m.remove(&token); !m.is_empty() });
+                instance_data.plugin.clear_stab(&self.gyroflow_plugin.manager_cache);
                 OK
             },
             PurgeCaches(ref mut effect) => {

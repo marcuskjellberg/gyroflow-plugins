@@ -170,13 +170,13 @@ impl GyroflowPluginBase {
         }
     }
 
-    /// Fit `source` into `bounds`, preserving the source aspect ratio (rounded to even dimensions)
-    pub fn fit_to_aspect(bounds: (usize, usize), source: (usize, usize)) -> (usize, usize) {
-        if source.0 == 0 || source.1 == 0 || bounds.0 == 0 || bounds.1 == 0 { return bounds; }
-        let scale = (bounds.0 as f64 / source.0 as f64).min(bounds.1 as f64 / source.1 as f64);
-        let w = ((source.0 as f64 * scale / 2.0).round() * 2.0) as usize;
-        let h = ((source.1 as f64 * scale / 2.0).round() * 2.0) as usize;
-        (w.min(bounds.0), h.min(bounds.1))
+    /// The key under which `stab_manager` caches the `StabilizationManager` for the current
+    /// parameter state. Must stay in sync with the key construction in `stab_manager`.
+    pub fn manager_cache_key(params: &dyn GyroflowPluginParams) -> Option<String> {
+        let disable_stretch = params.get_bool(Params::DisableStretch).ok()?;
+        let instance_id = params.get_string(Params::InstanceId).ok()?;
+        let path = params.get_string(Params::ProjectPath).ok()?;
+        Some(format!("{path}{disable_stretch}{instance_id}"))
     }
 
     pub fn get_project_path(file_path: &str) -> Option<String> {
@@ -397,10 +397,10 @@ pub struct GyroflowPluginBaseInstance {
     pub framebuffer_inverted: bool,
     pub anamorphic_adjust_size: bool,
     pub always_set_input_rotation: bool,
-    /// When the host forces the output to the timeline size (e.g. Resolve Edit/Color pages),
-    /// fit the default output size to the source aspect ratio instead of using the timeline
-    /// size directly, so the stabilized image is never stretched.
-    pub fit_output_size_to_source_ar: bool,
+    /// Always stabilize into the source video dimensions, ignoring timeline/project output
+    /// sizes (used on Resolve Edit/Color pages, where the plugin should behave like a native
+    /// clip: output at the source's natural size and let the host do all scaling/framing).
+    pub force_source_output_size: bool,
 
     pub opencl_disabled: bool,
 }
@@ -421,7 +421,7 @@ impl Clone for GyroflowPluginBaseInstance {
             framebuffer_inverted:           self.framebuffer_inverted,
             anamorphic_adjust_size:         self.anamorphic_adjust_size,
             always_set_input_rotation:      self.always_set_input_rotation,
-            fit_output_size_to_source_ar:   self.fit_output_size_to_source_ar,
+            force_source_output_size:       self.force_source_output_size,
             keyframable_params:             Arc::new(RwLock::new(self.keyframable_params.read().clone())),
         }
     }
@@ -443,7 +443,7 @@ impl Default for GyroflowPluginBaseInstance {
             framebuffer_inverted:           false,
             anamorphic_adjust_size:         true,
             always_set_input_rotation:      false,
-            fit_output_size_to_source_ar:   false,
+            force_source_output_size:       false,
             keyframable_params: Arc::new(RwLock::new(KeyframableParams {
                 use_gyroflows_keyframes:  false, // TODO param_set.parameter::<Bool>("UseGyroflowsKeyframes")?.get_value()?,
                 cached_keyframes:         KeyframeManager::default()
@@ -563,7 +563,7 @@ impl GyroflowPluginBaseInstance {
             self.timeline_size = out_size;
         }
 
-        let key = format!("{path}{disable_stretch}{instance_id}");
+        let key = format!("{path}{disable_stretch}{instance_id}"); // Must stay in sync with GyroflowPluginBase::manager_cache_key
         let cloned = manager_cache.lock().get(&key).map(Arc::clone);
         let stab = if let Some(stab) = cloned {
             // Cache it in this instance as well
@@ -607,13 +607,6 @@ impl GyroflowPluginBaseInstance {
                 match stab.load_video_file(file.get_file(), filesize, &url, None, true) {
                     Ok(md) => {
                         if out_size != (0, 0) {
-                            let out_size = if self.fit_output_size_to_source_ar {
-                                // Fit the timeline size to the source aspect ratio, so hosts that
-                                // force timeline-sized output don't stretch the stabilized image
-                                GyroflowPluginBase::fit_to_aspect(out_size, stab.params.read().size)
-                            } else {
-                                out_size
-                            };
                             stab.params.write().output_size = out_size; // Default to timeline output size
                         }
                         if let Some(preset_out_size) = stab.input_file.read().preset_output_size {
@@ -708,6 +701,16 @@ impl GyroflowPluginBaseInstance {
                             stab.params.write().video_rotation = r;
                         }
                     }
+                }
+            }
+
+            if self.force_source_output_size {
+                // Behave like a native clip: stabilize into the source video dimensions and
+                // let the host do all scaling/framing. This also prevents reduced-resolution
+                // (proxy) buffer sizes from getting baked into the output size.
+                let size = stab.params.read().size;
+                if size.0 > 0 && size.1 > 0 {
+                    stab.params.write().output_size = size;
                 }
             }
 
@@ -848,7 +851,14 @@ impl GyroflowPluginBaseInstance {
             }
 
             stab.init_size();
-            stab.set_output_size(params.get_f64(Params::OutputWidth)? as _, params.get_f64(Params::OutputHeight)? as _);
+            if self.force_source_output_size {
+                // Ignore the OutputWidth/OutputHeight params (disabled on these pages, and
+                // possibly stale from older sessions) — the output is always the source size
+                let size = stab.params.read().size;
+                stab.set_output_size(size.0 as _, size.1 as _);
+            } else {
+                stab.set_output_size(params.get_f64(Params::OutputWidth)? as _, params.get_f64(Params::OutputHeight)? as _);
+            }
 
             self.set_keyframe_provider(&stab);
 
@@ -1282,35 +1292,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fit_to_aspect_wider_source_into_taller_bounds() {
-        // 5312x2988 (16:9) source into a 4000x3000 (4:3) timeline
-        assert_eq!(GyroflowPluginBase::fit_to_aspect((4000, 3000), (5312, 2988)), (4000, 2250));
-    }
-
-    #[test]
-    fn fit_to_aspect_taller_source_into_wider_bounds() {
-        // Portrait 1080x1920 source into a 1920x1080 timeline
-        assert_eq!(GyroflowPluginBase::fit_to_aspect((1920, 1080), (1080, 1920)), (608, 1080));
-    }
-
-    #[test]
-    fn fit_to_aspect_matching_ratio_is_identity() {
-        assert_eq!(GyroflowPluginBase::fit_to_aspect((3840, 2160), (1920, 1080)), (3840, 2160));
-    }
-
-    #[test]
-    fn fit_to_aspect_zero_safety() {
-        assert_eq!(GyroflowPluginBase::fit_to_aspect((0, 0), (1920, 1080)), (0, 0));
-        assert_eq!(GyroflowPluginBase::fit_to_aspect((1920, 1080), (0, 0)), (1920, 1080));
-    }
-
-    #[test]
-    fn center_rect_composes_with_fitted_output() {
-        // The auto out_rect for the same 5312x2988-in-4000x3000 case:
-        // fitted stabilizer output is 4000x2250, centered in the 4000x3000 buffer
-        let fitted = GyroflowPluginBase::fit_to_aspect((4000, 3000), (5312, 2988));
-        let ratio = fitted.0 as f64 / fitted.1 as f64;
+    fn center_rect_extracts_source_ar_region() {
+        // 16:9-ish source region inside a 4:3 buffer -> centered band
+        let ratio = 5312.0 / 2988.0;
         assert_eq!(GyroflowPluginBase::get_center_rect(4000, 3000, ratio), (0, 375, 4000, 2250));
+    }
+
+    #[test]
+    fn center_rect_taller_region_in_wider_buffer() {
+        // 4:3 source region inside a 16:9 buffer -> centered pillarbox
+        assert_eq!(GyroflowPluginBase::get_center_rect(1920, 1080, 4.0 / 3.0), (240, 0, 1440, 1080));
     }
 
     #[test]
