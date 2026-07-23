@@ -21,6 +21,27 @@ deploy:
     cp "{{justfile_directory()}}/../LICENSE" "gyroflow-ofx-windows/Gyroflow.ofx.bundle/Contents/"
     cd gyroflow-ofx-windows ; 7z a ../Gyroflow-OpenFX-windows.zip .
 
+# Local development build: native arch only, ad-hoc signed, no notarization
+[macos]
+dev:
+    #!/bin/bash
+    set -e
+
+    cargo build --release
+
+    cd "{{TargetDir}}"
+    rm -rf gyroflow-ofx-dev/Gyroflow.ofx.bundle
+    mkdir -p gyroflow-ofx-dev/Gyroflow.ofx.bundle/Contents/MacOS
+    cp release/libgyroflow_ofx.dylib gyroflow-ofx-dev/Gyroflow.ofx.bundle/Contents/MacOS/Gyroflow.ofx
+    cp "{{justfile_directory()}}/res/Info.plist" gyroflow-ofx-dev/Gyroflow.ofx.bundle/Contents/
+    cp "{{justfile_directory()}}/../LICENSE"     gyroflow-ofx-dev/Gyroflow.ofx.bundle/Contents/
+
+    codesign -f -s - --deep gyroflow-ofx-dev/Gyroflow.ofx.bundle
+    echo ""
+    echo "Dev bundle ready: {{TargetDir}}/gyroflow-ofx-dev/Gyroflow.ofx.bundle"
+    echo "Install with:"
+    echo "  sudo mkdir -p /Library/OFX/Plugins && sudo rm -rf /Library/OFX/Plugins/Gyroflow.ofx.bundle && sudo cp -R {{TargetDir}}/gyroflow-ofx-dev/Gyroflow.ofx.bundle /Library/OFX/Plugins/"
+
 [macos]
 deploy:
     #!/bin/bash
