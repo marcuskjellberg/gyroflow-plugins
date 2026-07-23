@@ -170,15 +170,6 @@ impl GyroflowPluginBase {
         }
     }
 
-    /// The key under which `stab_manager` caches the `StabilizationManager` for the current
-    /// parameter state. Must stay in sync with the key construction in `stab_manager`.
-    pub fn manager_cache_key(params: &dyn GyroflowPluginParams) -> Option<String> {
-        let disable_stretch = params.get_bool(Params::DisableStretch).ok()?;
-        let instance_id = params.get_string(Params::InstanceId).ok()?;
-        let path = params.get_string(Params::ProjectPath).ok()?;
-        Some(format!("{path}{disable_stretch}{instance_id}"))
-    }
-
     pub fn get_project_path(file_path: &str) -> Option<String> {
         let mut project_path = std::path::Path::new(file_path).with_extension("gyroflow");
         if !project_path.exists() {
@@ -563,7 +554,7 @@ impl GyroflowPluginBaseInstance {
             self.timeline_size = out_size;
         }
 
-        let key = format!("{path}{disable_stretch}{instance_id}"); // Must stay in sync with GyroflowPluginBase::manager_cache_key
+        let key = format!("{path}{disable_stretch}{instance_id}");
         let cloned = manager_cache.lock().get(&key).map(Arc::clone);
         let stab = if let Some(stab) = cloned {
             // Cache it in this instance as well
