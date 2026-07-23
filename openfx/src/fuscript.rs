@@ -53,19 +53,31 @@ impl CurrentFileInfo {
     }
     /// Queries the current timeline item via Resolve's scripting API.
     /// `silent`: automatic (non user-initiated) query — no error dialog and no forced re-render.
+    ///
+    /// Retries a few times: right after a timeline edit (trimming, re-adding the effect),
+    /// `GetCurrentVideoItem()` briefly returns nil while Resolve is busy.
     pub fn query(current_file_info: Arc<Mutex<Option<Self>>>, current_file_info_pending: Arc<AtomicBool>, silent: bool) {
         std::thread::spawn(move || {
-            let mut cmd = std::process::Command::new(Self::get_fuscript().unwrap());
-            #[cfg(target_os = "windows")]
-            { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); } // CREATE_NO_WINDOW
+            fn new_cmd() -> std::process::Command {
+                let cmd = std::process::Command::new(CurrentFileInfo::get_fuscript().unwrap());
+                #[cfg(target_os = "windows")]
+                let cmd = { let mut cmd = cmd; use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); cmd }; // CREATE_NO_WINDOW
+                cmd
+            }
 
             let script = "i = Resolve():GetProjectManager():GetCurrentProject():GetCurrentTimeline():GetCurrentVideoItem();
                               p = i:GetMediaPoolItem():GetClipProperty();
                               print(p['FPS']);print(p['Frames']);print(p['Duration']);print(p['PAR']);print(p['Resolution']);print(p['File Path']);
                               print(i:GetLeftOffset());print(i:GetDuration());";
-            if let Ok(out) = cmd.args(["-q", "-l", "lua", "-x", &script]).output() {
-                let stdout = String::from_utf8(out.stdout).unwrap_or_default();
-                let stderr = String::from_utf8(out.stderr).unwrap_or_default();
+
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            let mut lines_owned: Vec<String> = Vec::new();
+            for attempt in 0..8 {
+                if attempt > 0 { std::thread::sleep(std::time::Duration::from_millis(700)); }
+                let Ok(out) = new_cmd().args(["-q", "-l", "lua", "-x", &script]).output() else { return; };
+                stdout = String::from_utf8(out.stdout).unwrap_or_default();
+                stderr = String::from_utf8(out.stderr).unwrap_or_default();
                 // There is a weird bug in DaVinci Resolve fuscript that it complains about
                 // missing python2 even regardless of explicitly specified `-l lua` argument.
                 // The error message itself is a subject to localization, so it can't be hardcoded in whole.
@@ -73,11 +85,17 @@ impl CurrentFileInfo {
                 fn is_missing_python2(line: &str) -> bool {
                     line.starts_with("sh:") && line.contains("python2:")
                 }
-                let errors = stderr.trim().lines()
-                        .filter(|line| !is_missing_python2(line))
-                        .collect::<Vec<_>>();
-                let lines = stdout.trim().lines().collect::<Vec<_>>();
-                if errors.is_empty() && lines.len() >= 6 {
+                let ok = stderr.trim().lines().filter(|line| !is_missing_python2(line)).count() == 0
+                    && stdout.trim().lines().count() >= 6;
+                if ok {
+                    lines_owned = stdout.trim().lines().map(|x| x.to_string()).collect();
+                    break;
+                }
+                log::debug!("fuscript attempt {attempt} failed, stderr: {}", stderr.trim());
+            }
+            let lines: Vec<&str> = lines_owned.iter().map(|x| x.as_str()).collect();
+            {
+                if lines.len() >= 6 {
                     let fps = lines[0].parse::<f64>().unwrap_or_default();
                     let frame_count = lines[1].parse::<usize>().unwrap_or_default();
                     let duration_s = Self::parse_duration(lines[2], fps);
@@ -109,7 +127,7 @@ impl CurrentFileInfo {
                             // Trigger render
                             let script = "c = Resolve():GetProjectManager():GetCurrentProject():GetCurrentTimeline():GetCurrentVideoItem();
                                               c:SetProperty('FlipX', c:GetProperty('FlipX'))";
-                            let _ = cmd.args(["-x", &script]).spawn();
+                            let _ = new_cmd().args(["-q", "-l", "lua", "-x", &script]).spawn();
                         }
                     }
                 } else {

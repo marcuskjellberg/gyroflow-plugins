@@ -120,6 +120,8 @@ struct InstanceData {
     /// The pending scripting query was automatic (not user-initiated):
     /// only consume the trim info from it, don't touch the project path
     trim_query_auto: bool,
+    /// When the last automatic trim query was issued (rate-limits re-queries)
+    last_trim_query: Option<std::time::Instant>,
 
     current_file_info_pending: Arc<AtomicBool>,
     current_file_info: Arc<Mutex<Option<CurrentFileInfo>>>,
@@ -274,6 +276,12 @@ impl Execute for GyroflowPlugin {
                         if sf + 3.0 < left || sf > left + len + 3.0 {
                             log::info!("Rendered source frame {sf} is outside the queried trim ({left} + {len} frames) — discarding trim info");
                             instance_data.resolve_trim = None;
+                            // The trim likely changed (e.g. the clip was extended) — re-query it
+                            if CurrentFileInfo::is_available() && instance_data.last_trim_query.map(|t| t.elapsed().as_secs_f64() > 3.0).unwrap_or(true) {
+                                instance_data.trim_query_auto = true;
+                                instance_data.last_trim_query = Some(std::time::Instant::now());
+                                CurrentFileInfo::query(instance_data.current_file_info.clone(), instance_data.current_file_info_pending.clone(), true);
+                            }
                         }
                     }
                     if let Some((left_frames, len_frames)) = instance_data.resolve_trim {
@@ -481,6 +489,7 @@ impl Execute for GyroflowPlugin {
                     video_path: None,
                     resolve_trim: None,
                     trim_query_auto: false,
+                    last_trim_query: None,
                     params: ParamHandler {
                         instance_id:              param_set.parameter("InstanceId")?,
                         project_data:             param_set.parameter("ProjectData")?,
@@ -571,6 +580,7 @@ impl Execute for GyroflowPlugin {
                             // recreates the effect instance when the clip is re-trimmed, so
                             // this picks up trim changes as they happen.
                             instance_data.trim_query_auto = true;
+                            instance_data.last_trim_query = Some(std::time::Instant::now());
                             CurrentFileInfo::query(instance_data.current_file_info.clone(), instance_data.current_file_info_pending.clone(), true);
                         }
                         if !instance_data.supports_output_size {
