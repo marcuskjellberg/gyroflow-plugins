@@ -202,6 +202,7 @@ impl Execute for GyroflowPlugin {
                 let fps = params.fps;
                 let src_fps = instance_data.source_clip.get_frame_rate().unwrap_or(fps);
                 let org_ratio = params.size.0 as f64 / params.size.1 as f64;
+                let stab_output_size = params.output_size;
                 let (has_accurate_timestamps, has_offsets) = {
                     let gyro = stab.gyro.read();
                     let md = gyro.file_metadata.read();
@@ -285,20 +286,33 @@ impl Execute for GyroflowPlugin {
                     rect.0 += src_rect.0;
                     rect.1 += src_rect.1;
                     Some(rect)
+                } else if !instance_data.supports_output_size {
+                    // The host forces the output to the timeline size (Resolve Edit/Color pages).
+                    // If the stabilizer output aspect ratio doesn't match the output buffer,
+                    // draw centered at the stabilizer aspect instead of stretching to fill
+                    let stab_ratio = stab_output_size.0 as f64 / stab_output_size.1.max(1) as f64;
+                    let rect = GyroflowPluginBase::get_center_rect(out_size.0, out_size.1, stab_ratio);
+                    if rect == (0, 0, out_size.0, out_size.1) {
+                        None
+                    } else {
+                        Some(rect)
+                    }
                 } else {
                     None
                 };
                 let out_scale = output_image.get_render_scale()?;
                 if (out_scale.x != 1.0 || out_scale.y != 1.0) && !in_args.get_opengl_enabled().unwrap_or_default() {
                     // log::debug!("out_scale: {:?}", out_scale);
-                    let w = (out_size.0 as f64 * out_scale.x as f64).round() as usize;
                     let h = (out_size.1 as f64 * out_scale.y as f64).round() as usize;
                     if out_size.1 > h {
+                        // Only part of the output buffer is valid at reduced render scale:
+                        // scale any existing rect into that region instead of discarding it
+                        let base = out_rect.unwrap_or((0, 0, out_size.0, out_size.1));
                         out_rect = Some((
-                            0,
-                            out_size.1 - h, // because the coordinates are inverted
-                            w,
-                            h
+                            (base.0 as f64 * out_scale.x as f64).round() as usize,
+                            out_size.1 - h + (base.1 as f64 * out_scale.y as f64).round() as usize, // because the coordinates are inverted
+                            (base.2 as f64 * out_scale.x as f64).round() as usize,
+                            (base.3 as f64 * out_scale.y as f64).round() as usize
                         ));
                     }
                 }
@@ -486,6 +500,7 @@ impl Execute for GyroflowPlugin {
                         framebuffer_inverted:        true,
                         anamorphic_adjust_size:      true,
                         always_set_input_rotation:   false,
+                        fit_output_size_to_source_ar: false,
                         has_motion:                  false,
                         keyframable_params: Arc::new(RwLock::new(KeyframableParams {
                             use_gyroflows_keyframes: param_set.parameter::<Bool>("UseGyroflowsKeyframes")?.get_value()?,
@@ -502,6 +517,9 @@ impl Execute for GyroflowPlugin {
                 let props: EffectInstance = effect.properties()?;
                 if matches!(props.get_resolve_page().as_deref(), Ok("Edit") | Ok("Color")) {
                     instance_data.supports_output_size = false;
+                    // These pages force the output to the timeline size: fit the default
+                    // output size to the source aspect ratio so the image is never stretched
+                    instance_data.plugin.fit_output_size_to_source_ar = true;
                 }
                 if matches!(props.get_resolve_page().as_deref(), Ok("Fusion")) {
                     instance_data.is_fusion_page = true;

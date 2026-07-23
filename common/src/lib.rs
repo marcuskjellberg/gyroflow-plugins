@@ -170,6 +170,15 @@ impl GyroflowPluginBase {
         }
     }
 
+    /// Fit `source` into `bounds`, preserving the source aspect ratio (rounded to even dimensions)
+    pub fn fit_to_aspect(bounds: (usize, usize), source: (usize, usize)) -> (usize, usize) {
+        if source.0 == 0 || source.1 == 0 || bounds.0 == 0 || bounds.1 == 0 { return bounds; }
+        let scale = (bounds.0 as f64 / source.0 as f64).min(bounds.1 as f64 / source.1 as f64);
+        let w = ((source.0 as f64 * scale / 2.0).round() * 2.0) as usize;
+        let h = ((source.1 as f64 * scale / 2.0).round() * 2.0) as usize;
+        (w.min(bounds.0), h.min(bounds.1))
+    }
+
     pub fn get_project_path(file_path: &str) -> Option<String> {
         let mut project_path = std::path::Path::new(file_path).with_extension("gyroflow");
         if !project_path.exists() {
@@ -388,6 +397,10 @@ pub struct GyroflowPluginBaseInstance {
     pub framebuffer_inverted: bool,
     pub anamorphic_adjust_size: bool,
     pub always_set_input_rotation: bool,
+    /// When the host forces the output to the timeline size (e.g. Resolve Edit/Color pages),
+    /// fit the default output size to the source aspect ratio instead of using the timeline
+    /// size directly, so the stabilized image is never stretched.
+    pub fit_output_size_to_source_ar: bool,
 
     pub opencl_disabled: bool,
 }
@@ -408,6 +421,7 @@ impl Clone for GyroflowPluginBaseInstance {
             framebuffer_inverted:           self.framebuffer_inverted,
             anamorphic_adjust_size:         self.anamorphic_adjust_size,
             always_set_input_rotation:      self.always_set_input_rotation,
+            fit_output_size_to_source_ar:   self.fit_output_size_to_source_ar,
             keyframable_params:             Arc::new(RwLock::new(self.keyframable_params.read().clone())),
         }
     }
@@ -429,6 +443,7 @@ impl Default for GyroflowPluginBaseInstance {
             framebuffer_inverted:           false,
             anamorphic_adjust_size:         true,
             always_set_input_rotation:      false,
+            fit_output_size_to_source_ar:   false,
             keyframable_params: Arc::new(RwLock::new(KeyframableParams {
                 use_gyroflows_keyframes:  false, // TODO param_set.parameter::<Bool>("UseGyroflowsKeyframes")?.get_value()?,
                 cached_keyframes:         KeyframeManager::default()
@@ -592,6 +607,13 @@ impl GyroflowPluginBaseInstance {
                 match stab.load_video_file(file.get_file(), filesize, &url, None, true) {
                     Ok(md) => {
                         if out_size != (0, 0) {
+                            let out_size = if self.fit_output_size_to_source_ar {
+                                // Fit the timeline size to the source aspect ratio, so hosts that
+                                // force timeline-sized output don't stretch the stabilized image
+                                GyroflowPluginBase::fit_to_aspect(out_size, stab.params.read().size)
+                            } else {
+                                out_size
+                            };
                             stab.params.write().output_size = out_size; // Default to timeline output size
                         }
                         if let Some(preset_out_size) = stab.input_file.read().preset_output_size {
