@@ -39,6 +39,15 @@ pub struct ComputedTime {
 }
 
 pub fn compute_timestamp(p: &TimeParams, ramp: impl Fn(i64) -> i64) -> ComputedTime {
+    if !p.time.is_finite() || !p.src_fps.is_finite() || p.src_fps <= 0.0 || !p.fps.is_finite() || p.fps <= 0.0 {
+        return ComputedTime {
+            fetch_time: if p.time.is_finite() { p.time } else { 0.0 },
+            timestamp_us: 0,
+            speed_stretch: 1.0,
+            trim_offset_frames: None,
+        };
+    }
+
     let mut speed_stretch = 1.0;
     let mut time_adj = 0.0;
     if let Some((min, max)) = p.frame_range {
@@ -291,5 +300,29 @@ mod tests {
         let c = compute_timestamp(&p, no_ramp);
         assert_eq!(c.speed_stretch, 1.0);
         assert_eq!(c.timestamp_us, ((5.0 / 24.0) * 1_000_000.0_f64).round() as i64);
+    }
+
+    #[test]
+    fn invalid_timing_metadata_has_a_bounded_fallback() {
+        for (time, src_fps, fps) in [
+            (5.0, 0.0, 24.0),
+            (5.0, 24.0, f64::NAN),
+            (f64::INFINITY, 24.0, 24.0),
+        ] {
+            let p = TimeParams {
+                time,
+                frame_range: Some((0.0, 100.0)),
+                src_fps,
+                fps,
+                duration_ms: 4_000.0,
+                src_frame: Some(10),
+                is_fusion_page: false,
+            };
+            let c = compute_timestamp(&p, no_ramp);
+            assert!(c.fetch_time.is_finite());
+            assert_eq!(c.timestamp_us, 0);
+            assert_eq!(c.speed_stretch, 1.0);
+            assert_eq!(c.trim_offset_frames, None);
+        }
     }
 }

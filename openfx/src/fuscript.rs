@@ -30,7 +30,27 @@ pub struct CurrentFileInfo {
     pub height: usize,
     pub pixel_aspect_ratio: String,
     /// Trim of the timeline item: (left offset into the source media, duration), in frames
-    pub trim_frames: Option<(f64, f64)>
+    pub trim_frames: Option<(f64, f64)>,
+    pub scaling: ResolveScaling,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveScaling {
+    Fit,
+    Other,
+}
+
+impl ResolveScaling {
+    fn from_values(clip_scaling: Option<i32>, inherited: Option<&str>) -> Self {
+        match clip_scaling {
+            Some(2) => Self::Fit,
+            Some(0) => match inherited.unwrap_or_default().to_ascii_lowercase().as_str() {
+                "scaletofit" => Self::Fit,
+                _ => Self::Other,
+            },
+            _ => Self::Other,
+        }
+    }
 }
 impl CurrentFileInfo {
     pub fn get_fuscript() -> Option<std::path::PathBuf> {
@@ -65,10 +85,13 @@ impl CurrentFileInfo {
                 cmd
             }
 
-            let script = "i = Resolve():GetProjectManager():GetCurrentProject():GetCurrentTimeline():GetCurrentVideoItem();
+            let script = "project = Resolve():GetProjectManager():GetCurrentProject(); timeline = project:GetCurrentTimeline(); i = timeline:GetCurrentVideoItem();
                               p = i:GetMediaPoolItem():GetClipProperty();
                               print(p['FPS']);print(p['Frames']);print(p['Duration']);print(p['PAR']);print(p['Resolution']);print(p['File Path']);
-                              print(i:GetLeftOffset());print(i:GetDuration());";
+                              print(i:GetLeftOffset());print(i:GetDuration());print(i:GetProperty('Scaling'));
+                              inherited = timeline:GetSetting('timelineInputResMismatchBehavior');
+                              if inherited == nil or inherited == '' then inherited = project:GetSetting('timelineInputResMismatchBehavior') end;
+                              print(inherited or '');";
 
             let mut stdout = String::new();
             let mut stderr = String::new();
@@ -107,6 +130,10 @@ impl CurrentFileInfo {
                         (Some(left), Some(duration)) if duration > 0.0 => Some((left, duration)),
                         _ => None
                     };
+                    let scaling = ResolveScaling::from_values(
+                        lines.get(8).and_then(|x| x.parse::<i32>().ok()),
+                        lines.get(9).copied(),
+                    );
                     if fps > 0.0 && frame_count > 0 && duration_s > 0.0 && !file_path.is_empty() {
                         let info = Self {
                             file_path: file_path.to_string(),
@@ -117,7 +144,8 @@ impl CurrentFileInfo {
                             height: *resolution.get(1).unwrap_or(&0),
                             pixel_aspect_ratio: par.to_string(),
                             project_path: gyroflow_plugin_base::GyroflowPluginBase::get_project_path(&file_path),
-                            trim_frames
+                            trim_frames,
+                            scaling,
                         };
                         log::debug!("{info:#?}");
                         *current_file_info.lock() = Some(info);
@@ -155,5 +183,18 @@ impl CurrentFileInfo {
         } else {
             0.0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_explicit_and_inherited_fit() {
+        assert_eq!(ResolveScaling::from_values(Some(2), Some("scaleToFill")), ResolveScaling::Fit);
+        assert_eq!(ResolveScaling::from_values(Some(3), Some("scaleToFit")), ResolveScaling::Other);
+        assert_eq!(ResolveScaling::from_values(Some(0), Some("scaleToFit")), ResolveScaling::Fit);
+        assert_eq!(ResolveScaling::from_values(Some(0), Some("scaleToFill")), ResolveScaling::Other);
     }
 }

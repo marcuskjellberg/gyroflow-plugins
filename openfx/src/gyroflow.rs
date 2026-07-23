@@ -19,12 +19,38 @@ struct GyroflowPlugin {
     gyroflow_plugin: GyroflowPluginBase,
 }
 
-pub fn frame_from_timetype(time: TimeType) -> f64 {
+pub fn frame_from_timetype(time: TimeType) -> Result<f64> {
     match time {
-        TimeType::Frame(x) => x,
-        TimeType::FrameOrMicrosecond((Some(x), _)) => x,
-        _ => panic!("Shouldn't happen"),
+        TimeType::Frame(x) => Ok(x),
+        TimeType::FrameOrMicrosecond((Some(x), _)) => Ok(x),
+        _ => Err(Error::UnknownError),
     }
+}
+
+fn image_layout(bounds: RectI, row_bytes: Int, depth: BitDepth) -> Option<(usize, usize, usize)> {
+    let width = usize::try_from(bounds.x2.checked_sub(bounds.x1)?).ok()?;
+    let height = usize::try_from(bounds.y2.checked_sub(bounds.y1)?).ok()?;
+    if width == 0 || height == 0 || row_bytes < 0 {
+        return None;
+    }
+
+    let bytes_per_pixel = match depth {
+        BitDepth::Byte => 4,
+        BitDepth::Short | BitDepth::Half => 8,
+        BitDepth::Float => 16,
+        BitDepth::None => return None,
+    };
+    let minimum_stride = width.checked_mul(bytes_per_pixel)?;
+    let stride = if row_bytes == 0 {
+        minimum_stride
+    } else {
+        usize::try_from(row_bytes).ok()?
+    };
+    if stride < minimum_stride || stride.checked_mul(height).is_none() {
+        return None;
+    }
+
+    Some((width, height, stride))
 }
 
 define_params!(ParamHandler {
@@ -84,9 +110,9 @@ define_params!(ParamHandler {
     set_label:   _s p, l { Ok(p.set_label(l)?) },
     set_hint:    _s p, h { Ok(p.set_hint(h) ?) },
     set_enabled: _s p, e { Ok(p.set_enabled(e)?) },
-    get_bool_at_time: _s p, t    { Ok(p.get_value_at_time(frame_from_timetype(t))?) },
-    get_f64_at_time:  _s p, t    { Ok(p.get_value_at_time(frame_from_timetype(t))?) },
-    set_f64_at_time:  _s p, t, v { Ok(p.set_value_at_time(frame_from_timetype(t), v)?) },
+    get_bool_at_time: _s p, t    { Ok(p.get_value_at_time(frame_from_timetype(t)?)?) },
+    get_f64_at_time:  _s p, t    { Ok(p.get_value_at_time(frame_from_timetype(t)?)?) },
+    set_f64_at_time:  _s p, t, v { Ok(p.set_value_at_time(frame_from_timetype(t)?, v)?) },
     is_keyframed: _s p { p.get_num_keys().unwrap_or_default() > 0 },
     get_keyframes: _s p {
         let num_keys = p.get_num_keys().unwrap_or_default();
@@ -140,9 +166,23 @@ impl InstanceData {
             source_rect = self.source_clip.get_image(0.0)?.get_bounds()?;
         }
         let in_size = ((source_rect.x2 - source_rect.x1) as usize, (source_rect.y2 - source_rect.y1) as usize);*/
-        let out_size = ((output_rect.x2 - output_rect.x1) as usize, (output_rect.y2 - output_rect.y1) as usize);
+        let width = usize::try_from(output_rect.x2.checked_sub(output_rect.x1).ok_or(Error::UnknownError)?).map_err(|_| Error::UnknownError)?;
+        let height = usize::try_from(output_rect.y2.checked_sub(output_rect.y1).ok_or(Error::UnknownError)?).map_err(|_| Error::UnknownError)?;
+        if width == 0 || height == 0 {
+            return Err(Error::UnknownError);
+        }
+        let out_size = (width, height);
+        let cache_context = if self.supports_output_size {
+            String::new()
+        } else {
+            let divisor = greatest_common_divisor(width, height);
+            let trim = self.resolve_trim
+                .map(|(left, duration)| format!("{left:.3}:{duration:.3}"))
+                .unwrap_or_else(|| "none".to_string());
+            format!("trim:{trim}|aspect:{}:{}", width / divisor, height / divisor)
+        };
 
-        self.plugin.stab_manager(&mut self.params, manager_cache, out_size, loading_pending_video_file).map_err(|e| {
+        self.plugin.stab_manager_with_cache_context(&mut self.params, manager_cache, out_size, loading_pending_video_file, &cache_context).map_err(|e| {
             log::error!("plugin.stab_manager error: {e:?}");
             Error::UnknownError
         })
@@ -171,16 +211,29 @@ impl InstanceData {
                     return Ok(false);
                 }
                 if let Some(proj) = &current_file.project_path {
-                    self.params.set_string(Params::ProjectPath, &proj).unwrap(); // TODO: unwrap
+                    self.params.set_string(Params::ProjectPath, proj).map_err(|e| {
+                        log::error!("Failed to set project path: {e}");
+                        Error::UnknownError
+                    })?;
                 } else {
                     // Try to use the video directly
-                    self.params.set_string(Params::ProjectPath, &current_file.file_path).unwrap(); // TODO: unwrap
+                    self.params.set_string(Params::ProjectPath, &current_file.file_path).map_err(|e| {
+                        log::error!("Failed to set source path: {e}");
+                        Error::UnknownError
+                    })?;
                     return Ok(true);
                 }
             }
         }
         Ok(false)
     }
+}
+
+fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left.max(1)
 }
 
 impl Execute for GyroflowPlugin {
@@ -229,6 +282,10 @@ impl Execute for GyroflowPlugin {
                 let params = stab.params.read();
                 let fps = params.fps;
                 let src_fps = instance_data.source_clip.get_frame_rate().unwrap_or(fps);
+                if !time.is_finite() || !fps.is_finite() || fps <= 0.0 || !src_fps.is_finite() || src_fps <= 0.0 || params.size.0 == 0 || params.size.1 == 0 {
+                    log::error!("Invalid render timing or source size: time={time}, fps={fps}, src_fps={src_fps}, size={:?}", params.size);
+                    return FAILED;
+                }
                 let org_ratio = params.size.0 as f64 / params.size.1 as f64;
                 let stab_output_size = params.output_size;
                 let (has_accurate_timestamps, has_offsets) = {
@@ -310,21 +367,36 @@ impl Execute for GyroflowPlugin {
                     instance_data.source_clip.get_image(time)?
                 };
 
-                let source_rect: RectI = source_image.get_region_of_definition()?;
+                let source_bounds = source_image.get_bounds()?;
+                let output_bounds = output_image.get_bounds()?;
+                let src_row_bytes = source_image.get_row_bytes()?;
+                let out_row_bytes = output_image.get_row_bytes()?;
+                let src_depth = source_image.get_pixel_depth()?;
+                let out_depth = output_image.get_pixel_depth()?;
+                if src_depth != out_depth {
+                    log::error!("Source and output pixel depths differ: {src_depth:?} != {out_depth:?}");
+                    return FAILED;
+                }
+                let Some(src_size) = image_layout(source_bounds, src_row_bytes, src_depth) else {
+                    log::error!("Invalid source image layout: bounds={source_bounds:?}, row_bytes={src_row_bytes}, depth={src_depth:?}");
+                    return FAILED;
+                };
+                let Some(out_size) = image_layout(output_bounds, out_row_bytes, out_depth) else {
+                    log::error!("Invalid output image layout: bounds={output_bounds:?}, row_bytes={out_row_bytes}, depth={out_depth:?}");
+                    return FAILED;
+                };
+                let src_stride = src_size.2;
+                let out_stride = out_size.2;
 
-                let src_stride = source_image.get_row_bytes()? as usize;
-                let out_stride = output_image.get_row_bytes()? as usize;
-                let mut src_size = ((source_rect.x2 - source_rect.x1) as usize, (source_rect.y2 - source_rect.y1) as usize, src_stride);
-                let mut out_size = ((output_rect.x2 - output_rect.x1) as usize, (output_rect.y2 - output_rect.y1) as usize, out_stride);
+                let src_rect = GyroflowPluginBase::get_center_rect_strict(src_size.0, src_size.1, org_ratio);
 
-                if src_size.2 <= 0 { src_size.2 = src_size.0 * 4 * 4 }; // assuming 32-bit float
-                if out_size.2 <= 0 { out_size.2 = out_size.0 * 4 * 4 }; // assuming 32-bit float
-
-                let src_rect = GyroflowPluginBase::get_center_rect(src_size.0, src_size.1, org_ratio);
-
-                let mut out_rect = if instance_data.params.get_bool_at_time(Params::DontDrawOutside, TimeType::Frame(time)).unwrap() { // TODO: unwrap
+                let dont_draw_outside = instance_data.params.get_bool_at_time(Params::DontDrawOutside, TimeType::Frame(time)).map_err(|e| {
+                    log::error!("Failed to read DontDrawOutside: {e}");
+                    Error::UnknownError
+                })?;
+                let mut out_rect = if dont_draw_outside {
                     let output_ratio = out_size.0 as f64 / out_size.1 as f64;
-                    let mut rect = GyroflowPluginBase::get_center_rect(src_rect.2, src_rect.3, output_ratio);
+                    let mut rect = GyroflowPluginBase::get_center_rect_strict(src_rect.2, src_rect.3, output_ratio);
                     rect.0 += src_rect.0;
                     rect.1 += src_rect.1;
                     Some(rect)
@@ -333,7 +405,7 @@ impl Execute for GyroflowPlugin {
                     // If the stabilizer output aspect ratio doesn't match the output buffer,
                     // draw centered at the stabilizer aspect instead of stretching to fill
                     let stab_ratio = stab_output_size.0 as f64 / stab_output_size.1.max(1) as f64;
-                    let rect = GyroflowPluginBase::get_center_rect(out_size.0, out_size.1, stab_ratio);
+                    let rect = GyroflowPluginBase::get_center_rect_strict(out_size.0, out_size.1, stab_ratio);
                     if rect == (0, 0, out_size.0, out_size.1) {
                         None
                     } else {
@@ -342,23 +414,6 @@ impl Execute for GyroflowPlugin {
                 } else {
                     None
                 };
-                let out_scale = output_image.get_render_scale()?;
-                if (out_scale.x != 1.0 || out_scale.y != 1.0) && !in_args.get_opengl_enabled().unwrap_or_default() {
-                    // log::debug!("out_scale: {:?}", out_scale);
-                    let h = (out_size.1 as f64 * out_scale.y as f64).round() as usize;
-                    if out_size.1 > h {
-                        // Only part of the output buffer is valid at reduced render scale:
-                        // scale any existing rect into that region instead of discarding it
-                        let base = out_rect.unwrap_or((0, 0, out_size.0, out_size.1));
-                        out_rect = Some((
-                            (base.0 as f64 * out_scale.x as f64).round() as usize,
-                            out_size.1 - h + (base.1 as f64 * out_scale.y as f64).round() as usize, // because the coordinates are inverted
-                            (base.2 as f64 * out_scale.x as f64).round() as usize,
-                            (base.3 as f64 * out_scale.y as f64).round() as usize
-                        ));
-                    }
-                }
-
                 if _plugin_context.get_host().get_name().as_deref().ok() == Some("com.vegascreativesoftware.vegas") {
                     out_rect = None;
                 }
@@ -408,10 +463,6 @@ impl Execute for GyroflowPlugin {
                         log::info!("OpenGL: src_size: {src_size:?} | {src_stride}, out_size: {out_size:?} | {out_stride}");
                         let texture = source_image.get_opengl_texture_index()? as u32;
                         let out_texture = output_image.get_opengl_texture_index()? as u32;
-                        let mut src_size = src_size;
-                        let mut out_size = out_size;
-                        src_size.2 = src_size.0 * 4 * (source_image.get_pixel_depth()?.bits() / 8);
-                        out_size.2 = out_size.0 * 4 * (output_image.get_pixel_depth()?.bits() / 8);
 
                         log::info!("OpenGL in: {texture}, out: {out_texture} src_size: {src_size:?}, out_size: {out_size:?}, in_rect: {src_rect:?}, out_rect: {out_rect:?}");
                         Some((
@@ -421,21 +472,21 @@ impl Execute for GyroflowPlugin {
                         ))
                     } else {
                         log::info!("CPU: src_size: {src_size:?} | {src_stride}, out_size: {out_size:?} | {out_stride}");
+                        if src_row_bytes <= 0 || out_row_bytes <= 0 {
+                            log::error!("CPU images require positive row bytes: source={src_row_bytes}, output={out_row_bytes}");
+                            return FAILED;
+                        }
                         use std::slice::from_raw_parts_mut;
-                        let src_buf = unsafe { match source_image.get_pixel_depth()? {
-                            BitDepth::None  => { return FAILED; }
-                            BitDepth::Byte  => { let b = source_image.get_descriptor::<RGBAColourB>()?; let mut b = b.data(); from_raw_parts_mut(b.ptr_mut(0), b.bytes()) },
-                            BitDepth::Short => { let b = source_image.get_descriptor::<RGBAColourS>()?; let mut b = b.data(); from_raw_parts_mut(b.ptr_mut(0), b.bytes()) },
-                            BitDepth::Half  => { let b = source_image.get_descriptor::<RGBAColourS>()?; let mut b = b.data(); from_raw_parts_mut(b.ptr_mut(0), b.bytes()) },
-                            BitDepth::Float => { let b = source_image.get_descriptor::<RGBAColourF>()?; let mut b = b.data(); from_raw_parts_mut(b.ptr_mut(0), b.bytes()) }
-                        } };
-                        let dst_buf = unsafe { match output_image.get_pixel_depth()? {
-                            BitDepth::None  => { return FAILED; }
-                            BitDepth::Byte  => { let b = output_image.get_descriptor::<RGBAColourB>()?; let mut b = b.data(); from_raw_parts_mut(b.ptr_mut(0), b.bytes()) },
-                            BitDepth::Short => { let b = output_image.get_descriptor::<RGBAColourS>()?; let mut b = b.data(); from_raw_parts_mut(b.ptr_mut(0), b.bytes()) },
-                            BitDepth::Half  => { let b = output_image.get_descriptor::<RGBAColourS>()?; let mut b = b.data(); from_raw_parts_mut(b.ptr_mut(0), b.bytes()) },
-                            BitDepth::Float => { let b = output_image.get_descriptor::<RGBAColourF>()?; let mut b = b.data(); from_raw_parts_mut(b.ptr_mut(0), b.bytes()) }
-                        } };
+                        let src_ptr = source_image.get_data()? as *mut u8;
+                        let dst_ptr = output_image.get_data()? as *mut u8;
+                        if src_ptr.is_null() || dst_ptr.is_null() {
+                            log::error!("CPU image has a null data pointer");
+                            return FAILED;
+                        }
+                        let src_len = src_stride.checked_mul(src_size.1).ok_or(Error::UnknownError)?;
+                        let dst_len = out_stride.checked_mul(out_size.1).ok_or(Error::UnknownError)?;
+                        let src_buf = unsafe { from_raw_parts_mut(src_ptr, src_len) };
+                        let dst_buf = unsafe { from_raw_parts_mut(dst_ptr, dst_len) };
                         Some((
                             BufferSource::Cpu { buffer: src_buf },
                             BufferSource::Cpu { buffer: dst_buf },
@@ -451,7 +502,7 @@ impl Execute for GyroflowPlugin {
                         output: BufferDescription { size: out_size, rect: out_rect,       data: buffers.1, rotation: None,           texture_copy: buffers.2 }
                     };
 
-                    let processed = match output_image.get_pixel_depth()? {
+                    let processed = match out_depth {
                         BitDepth::None  => { return FAILED; },
                         BitDepth::Byte  => stab.process_pixels::<RGBA8>  (timestamp_us, None, &mut buffers),
                         BitDepth::Short => stab.process_pixels::<RGBA16> (timestamp_us, None, &mut buffers),
@@ -632,7 +683,11 @@ impl Execute for GyroflowPlugin {
                     return OK;
                 }
                 let mut out_rod = rod;
-                if instance_data.plugin.original_output_size != (0, 0) && !instance_data.params.get_bool_at_time(Params::DontDrawOutside, TimeType::Frame(time)).unwrap() { // TODO: unwrap
+                let dont_draw_outside = instance_data.params.get_bool_at_time(Params::DontDrawOutside, TimeType::Frame(time)).map_err(|e| {
+                    log::error!("Failed to read DontDrawOutside: {e}");
+                    Error::UnknownError
+                })?;
+                if instance_data.plugin.original_output_size != (0, 0) && !dont_draw_outside {
                     out_rod.x2 = instance_data.plugin.original_output_size.0 as f64;
                     out_rod.y2 = instance_data.plugin.original_output_size.1 as f64;
                 }
@@ -789,7 +844,10 @@ impl Execute for GyroflowPlugin {
 
                 effect_properties.set_single_instance(false)?;
                 effect_properties.set_host_frame_threading(false)?;
-                effect_properties.set_render_thread_safety(ImageEffectRender::FullySafe)?;
+                // The pinned ofx-rs wrapper uses an unsynchronized global registry and
+                // exposes instance data as a raw mutable reference. Concurrent OFX calls
+                // are therefore unsafe even if the stabilization core is thread-safe.
+                effect_properties.set_render_thread_safety(ImageEffectRender::Unsafe)?;
                 effect_properties.set_supports_multi_resolution(true)?;
                 effect_properties.set_temporal_clip_access(true)?;
 
@@ -800,7 +858,9 @@ impl Execute for GyroflowPlugin {
                 }
 
                 let opencl_devices = gyroflow_plugin_base::opencl::OclWrapper::list_devices();
-                let wgpu_devices = std::thread::spawn(|| gyroflow_plugin_base::wgpu::WgpuWrapper::list_devices()).join().unwrap();
+                let wgpu_devices = std::thread::spawn(gyroflow_plugin_base::wgpu::WgpuWrapper::list_devices)
+                    .join()
+                    .unwrap_or_default();
                 if !opencl_devices.is_empty() {
                     let _ = effect_properties.set_opencl_render_supported("true");
                     let _ = effect_properties.set_opengl_render_supported("true");
@@ -833,5 +893,44 @@ impl Execute for GyroflowPlugin {
 
             _ => REPLY_DEFAULT,
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn layout_uses_actual_bounds_and_stride() {
+        let bounds = RectI { x1: 100, y1: 50, x2: 2020, y2: 1130 };
+        assert_eq!(image_layout(bounds, 8192, BitDepth::Byte), Some((1920, 1080, 8192)));
+    }
+
+    #[test]
+    fn layout_derives_texture_stride_from_pixel_depth() {
+        let bounds = RectI { x1: 0, y1: 0, x2: 100, y2: 50 };
+        assert_eq!(image_layout(bounds, 0, BitDepth::Half), Some((100, 50, 800)));
+        assert_eq!(image_layout(bounds, 0, BitDepth::Float), Some((100, 50, 1600)));
+    }
+
+    #[test]
+    fn layout_rejects_invalid_geometry_and_strides() {
+        let valid = RectI { x1: 0, y1: 0, x2: 100, y2: 50 };
+        let inverted = RectI { x1: 100, y1: 0, x2: 0, y2: 50 };
+        assert_eq!(image_layout(valid, -400, BitDepth::Byte), None);
+        assert_eq!(image_layout(valid, 399, BitDepth::Byte), None);
+        assert_eq!(image_layout(inverted, 400, BitDepth::Byte), None);
+        assert_eq!(image_layout(valid, 400, BitDepth::None), None);
+    }
+
+    #[test]
+    fn aspect_context_is_stable_across_proxy_resolutions() {
+        let normalize = |width, height| {
+            let divisor = greatest_common_divisor(width, height);
+            (width / divisor, height / divisor)
+        };
+        assert_eq!(normalize(3840, 2160), normalize(1920, 1080));
+        assert_eq!(normalize(1920, 1080), (16, 9));
+        assert_ne!(normalize(1920, 1080), normalize(1440, 1080));
     }
 }

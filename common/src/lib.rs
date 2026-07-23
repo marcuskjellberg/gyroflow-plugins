@@ -153,21 +153,28 @@ impl GyroflowPluginBase {
         // If aspect ratio is different
         let new_ratio = width as f64 / height as f64;
         if (new_ratio - org_ratio).abs() > 0.1 {
-            // Get center rect of original aspect ratio
-            let rect = if new_ratio > org_ratio {
-                ((height as f64 * org_ratio).round() as usize, height)
-            } else {
-                (width, (width as f64 / org_ratio).round() as usize)
-            };
-            (
-                (width - rect.0) / 2, // x
-                (height - rect.1) / 2, // y
-                rect.0, // width
-                rect.1 // height
-            )
+            Self::get_center_rect_strict(width, height, org_ratio)
         } else {
             (0, 0, width, height)
         }
+    }
+
+    pub fn get_center_rect_strict(width: usize, height: usize, org_ratio: f64) -> (usize, usize, usize, usize) {
+        if width == 0 || height == 0 || !org_ratio.is_finite() || org_ratio <= 0.0 {
+            return (0, 0, width, height);
+        }
+        let new_ratio = width as f64 / height as f64;
+        let rect = if new_ratio > org_ratio {
+            (((height as f64 * org_ratio).round() as usize).min(width), height)
+        } else {
+            (width, ((width as f64 / org_ratio).round() as usize).min(height))
+        };
+        (
+            (width - rect.0) / 2,
+            (height - rect.1) / 2,
+            rect.0,
+            rect.1
+        )
     }
 
     pub fn get_project_path(file_path: &str) -> Option<String> {
@@ -543,6 +550,10 @@ impl GyroflowPluginBaseInstance {
     }
 
     pub fn stab_manager(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, out_size: (usize, usize), open_gyroflow_if_no_data: bool) -> PluginResult<Arc<StabilizationManager>> {
+        self.stab_manager_with_cache_context(params, manager_cache, out_size, open_gyroflow_if_no_data, "")
+    }
+
+    pub fn stab_manager_with_cache_context(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, out_size: (usize, usize), open_gyroflow_if_no_data: bool, cache_context: &str) -> PluginResult<Arc<StabilizationManager>> {
         let mut disable_stretch = params.get_bool(Params::DisableStretch)?;
 
         let instance_id = params.get_string(Params::InstanceId)?;
@@ -556,7 +567,7 @@ impl GyroflowPluginBaseInstance {
             self.timeline_size = out_size;
         }
 
-        let key = format!("{path}{disable_stretch}{instance_id}");
+        let key = manager_cache_key(&path, disable_stretch, &instance_id, cache_context);
         let cloned = manager_cache.lock().get(&key).map(Arc::clone);
         let stab = if let Some(stab) = cloned {
             // Cache it in this instance as well
@@ -1088,6 +1099,15 @@ pub fn hash_string(s: &str) -> u64 {
     hasher.finish()
 }
 
+fn manager_cache_key(path: &str, disable_stretch: bool, instance_id: &str, context: &str) -> String {
+    format!(
+        "path:{}:{path}|stretch:{disable_stretch}|instance:{}:{instance_id}|context:{}:{context}",
+        path.len(),
+        instance_id.len(),
+        context.len()
+    )
+}
+
 impl std::str::FromStr for Params {
     type Err = serde_json::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -1297,5 +1317,23 @@ mod tests {
     fn center_rect_close_ratio_is_full_rect() {
         // Within the 0.1 ratio threshold -> no letterboxing
         assert_eq!(GyroflowPluginBase::get_center_rect(1920, 1080, 1.8), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn strict_center_rect_crops_nearby_aspect_ratios() {
+        assert_eq!(GyroflowPluginBase::get_center_rect_strict(1920, 1080, 1.8), (0, 6, 1920, 1067));
+        assert_eq!(GyroflowPluginBase::get_center_rect_strict(1920, 1080, 16.0 / 9.0), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn manager_cache_context_is_unambiguous_and_isolates_render_state() {
+        let base = manager_cache_key("clip.mov", false, "12", "trim:10:20|aspect:16:9");
+        assert_eq!(base, manager_cache_key("clip.mov", false, "12", "trim:10:20|aspect:16:9"));
+        assert_ne!(base, manager_cache_key("clip.mov", false, "12", "trim:30:20|aspect:16:9"));
+        assert_ne!(base, manager_cache_key("clip.mov", false, "12", "trim:10:20|aspect:4:3"));
+        assert_ne!(
+            manager_cache_key("ab", false, "c", ""),
+            manager_cache_key("a", false, "bc", "")
+        );
     }
 }

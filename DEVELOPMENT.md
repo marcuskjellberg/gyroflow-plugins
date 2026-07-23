@@ -107,12 +107,22 @@ The Render-action time math is a pure, unit-tested function (`compute_timestamp`
 
 ## Manager cache semantics (common/src/lib.rs `stab_manager`)
 
-- Cache key = `{project_path}{disable_stretch}{instance_id}`. Pieces of a cut clip share
-  the key (and thus one `StabilizationManager`) until the user edits a parameter
-  (`ever_changed` → new `instance_id`).
+- The base cache key contains length-delimited project path, disable-stretch state, and
+  instance ID. Resolve Edit/Color adds the accepted trim and reduced output aspect ratio.
+  Cuts with different visible ranges therefore cannot overwrite each other's adaptive-zoom
+  solve, while full/half/quarter-resolution buffers with the same aspect can still share.
 - `invalidate_blocking_smoothing()` only sets flags; the recompute happens inside the
   next `process_pixels` (visible in logs as `Max zoom iteration …` right after
   `Setting trim range …`).
+
+## OpenFX safety
+
+- Render thread safety is declared `Unsafe`. The pinned `ofx-rs` wrapper dispatches through
+  an unsynchronized global registry and exposes instance data through raw mutable pointers,
+  so advertising `FullySafe` allowed undefined behavior during concurrent Resolve renders.
+- Buffer dimensions come from `kOfxImagePropBounds`, not the image RoD. Bounds, pixel depth,
+  row bytes, data pointers, and size arithmetic are validated before CPU slices are created.
+  Negative row bytes are rejected until explicit orientation normalization is implemented.
 
 ## Debugging
 
