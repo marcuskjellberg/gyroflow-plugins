@@ -112,8 +112,14 @@ struct InstanceData {
     supports_output_size: bool,
     is_fusion_page: bool,
     file_path: Option<String>,
-    /// Last logged (start_ms, end_ms) trim detection, to avoid log spam
-    last_trim_log: Option<(i64, i64)>,
+    /// The source video path of this instance (kept for matching scripting-query results)
+    video_path: Option<String>,
+    /// Trim of the timeline item queried from Resolve's scripting API:
+    /// (left offset into the source media, duration), in frames
+    resolve_trim: Option<(f64, f64)>,
+    /// The pending scripting query was automatic (not user-initiated):
+    /// only consume the trim info from it, don't touch the project path
+    trim_query_auto: bool,
 
     current_file_info_pending: Arc<AtomicBool>,
     current_file_info: Arc<Mutex<Option<CurrentFileInfo>>>,
@@ -144,6 +150,24 @@ impl InstanceData {
             self.current_file_info_pending.store(false, SeqCst);
             let lock = self.current_file_info.lock();
             if let Some(ref current_file) = *lock {
+                // Consume the timeline item's trim, but only if the queried item plays
+                // this instance's video (the scripting API returns whatever is under the
+                // playhead, which can be a different clip)
+                if let Some(trim) = current_file.trim_frames {
+                    let matches = self.video_path.as_deref().map(|p| p == current_file.file_path).unwrap_or(true);
+                    if matches {
+                        if self.resolve_trim != Some(trim) {
+                            log::info!("Timeline item trim from Resolve: left offset {} frames, duration {} frames", trim.0, trim.1);
+                            self.resolve_trim = Some(trim);
+                        }
+                    } else {
+                        log::info!("Ignoring trim of a different timeline item: {} != {:?}", current_file.file_path, self.video_path);
+                    }
+                }
+                if self.trim_query_auto {
+                    self.trim_query_auto = false;
+                    return Ok(false);
+                }
                 if let Some(proj) = &current_file.project_path {
                     self.params.set_string(Params::ProjectPath, &proj).unwrap(); // TODO: unwrap
                 } else {
@@ -239,24 +263,24 @@ impl Execute for GyroflowPlugin {
 
                 // log::info!("fps: {fps:?}, src_fps: {src_fps:?}, speed_stretch: {:.6}, time: {time:?}, timestamp_us: {timestamp_us:?}, frame_range: {frame_range:?}, src_frame: {src_frame:?}, trim_offset: {:?}", computed.speed_stretch, computed.trim_offset_frames);
 
-                // Feed the detected trim into gyroflow-core, so that adaptive zoom is solved
-                // over the visible sub-clip instead of the whole source recording.
-                // Re-trimming the clip re-solves the zoom over the new range (shrinking too),
-                // just like changing the trim in the Gyroflow app.
-                if let (Some(offset_frames), Some((range_min, range_max))) = (computed.trim_offset_frames, frame_range) {
-                    if duration_ms > 0.0 && fps > 0.0 && src_fps > 0.0 {
-                        let clip_len_frames = ((range_max - range_min) * (fps / src_fps)).max(0.0);
-                        let start_ms = (offset_frames / fps * 1000.0).max(0.0);
-                        let end_ms = ((offset_frames + clip_len_frames) / fps * 1000.0).min(duration_ms);
+                // Feed the timeline item's trim (queried from Resolve's scripting API) into
+                // gyroflow-core, so that adaptive zoom is solved over the visible sub-clip
+                // instead of the whole source recording — just like trimming in the Gyroflow app.
+                if duration_ms > 0.0 && fps > 0.0 {
+                    // Sanity check: the source frames actually rendered must lie inside the
+                    // queried trim, otherwise the query hit a different timeline item
+                    if let (Some((left, len)), Some(sf)) = (instance_data.resolve_trim, src_frame) {
+                        let sf = sf as f64;
+                        if sf + 3.0 < left || sf > left + len + 3.0 {
+                            log::info!("Rendered source frame {sf} is outside the queried trim ({left} + {len} frames) — discarding trim info");
+                            instance_data.resolve_trim = None;
+                        }
+                    }
+                    if let Some((left_frames, len_frames)) = instance_data.resolve_trim {
+                        let start_ms = (left_frames / fps * 1000.0).max(0.0);
+                        let end_ms = (((left_frames + len_frames) / fps) * 1000.0).min(duration_ms);
                         if end_ms > start_ms {
-                            let log_key = (start_ms.round() as i64, end_ms.round() as i64);
-                            if instance_data.last_trim_log != Some(log_key) {
-                                instance_data.last_trim_log = Some(log_key);
-                                log::info!("Trim detected: src_frame: {src_frame:?}, frame_range: {frame_range:?}, time: {time}, offset_frames: {offset_frames:.1}, clip: {:.0}-{:.0} ms of {duration_ms:.0} ms", start_ms, end_ms);
-                            }
-                            // The host-reported range jitters by a frame or two between renders
-                            // (and between Resolve's internal instances of the same clip) — only
-                            // re-solve the zoom when the range moved further than that
+                            // Tolerate a few frames of rounding/jitter before re-solving the zoom
                             let tolerance_ms = 3.0 * 1000.0 / fps;
                             let new_range = if start_ms <= tolerance_ms && end_ms >= duration_ms - tolerance_ms {
                                 (0.0, 1.0) // Full clip -> no trim
@@ -271,9 +295,6 @@ impl Execute for GyroflowPlugin {
                             }
                         }
                     }
-                } else if instance_data.last_trim_log.is_none() {
-                    instance_data.last_trim_log = Some((-1, -1));
-                    log::info!("Trim detection unavailable: src_frame: {src_frame:?}, frame_range: {frame_range:?}, duration_ms: {duration_ms:.0}");
                 }
                 let source_image = if in_args.get_opengl_enabled().unwrap_or_default() {
                     instance_data.source_clip.load_texture(time, None)?
@@ -457,7 +478,9 @@ impl Execute for GyroflowPlugin {
                     supports_output_size: true,
                     is_fusion_page: false,
                     file_path: None,
-                    last_trim_log: None,
+                    video_path: None,
+                    resolve_trim: None,
+                    trim_query_auto: false,
                     params: ParamHandler {
                         instance_id:              param_set.parameter("InstanceId")?,
                         project_data:             param_set.parameter("ProjectData")?,
@@ -541,6 +564,15 @@ impl Execute for GyroflowPlugin {
                 if let Ok(path) = props.get_src_file_path() {
                     if !path.is_empty() {
                         instance_data.file_path = Some(path.clone());
+                        instance_data.video_path = Some(path.clone());
+                        if !instance_data.supports_output_size && CurrentFileInfo::is_available() {
+                            // Query the timeline item's trim from Resolve's scripting API
+                            // (async; the result is consumed on the next render). Resolve
+                            // recreates the effect instance when the clip is re-trimmed, so
+                            // this picks up trim changes as they happen.
+                            instance_data.trim_query_auto = true;
+                            CurrentFileInfo::query(instance_data.current_file_info.clone(), instance_data.current_file_info_pending.clone(), true);
+                        }
                         if !instance_data.supports_output_size {
                             // Read the video dimensions right away: Resolve queries the output
                             // RoD before the first render, and it must already report the
@@ -570,7 +602,7 @@ impl Execute for GyroflowPlugin {
             InstanceChanged(ref mut effect, ref mut in_args) => {
                 let instance_data: &mut InstanceData = effect.get_instance_data()?;
                 if in_args.get_name()? == "LoadCurrent" {
-                    CurrentFileInfo::query(instance_data.current_file_info.clone(), instance_data.current_file_info_pending.clone());
+                    CurrentFileInfo::query(instance_data.current_file_info.clone(), instance_data.current_file_info_pending.clone(), false);
                 }
                 if in_args.get_name()? == "Source" || in_args.get_name()? == "Output" || in_args.get_name()? == "ResolveUseAlphaForTrackCompositing" {
                     log::info!("InstanceChanged {:?} {:?}", in_args.get_name()?, in_args.get_change_reason()?);
