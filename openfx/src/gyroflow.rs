@@ -546,7 +546,7 @@ impl Execute for GyroflowPlugin {
                         framebuffer_inverted:        true,
                         anamorphic_adjust_size:      true,
                         always_set_input_rotation:   false,
-                        force_source_output_size:    false,
+                        fill_output_to_host_aspect:  false,
                         has_motion:                  false,
                         keyframable_params: Arc::new(RwLock::new(KeyframableParams {
                             use_gyroflows_keyframes: param_set.parameter::<Bool>("UseGyroflowsKeyframes")?.get_value()?,
@@ -563,9 +563,10 @@ impl Execute for GyroflowPlugin {
                 let props: EffectInstance = effect.properties()?;
                 if matches!(props.get_resolve_page().as_deref(), Ok("Edit") | Ok("Color")) {
                     instance_data.supports_output_size = false;
-                    // On these pages the plugin should behave like a native clip: output at
-                    // the source's natural size and let Resolve do all scaling/framing
-                    instance_data.plugin.force_source_output_size = true;
+                    // These pages force timeline-sized buffers: fill the frame with a
+                    // timeline-aspect crop of the source (no bars, no stretching), letting
+                    // adaptive zoom use the cropped-away headroom
+                    instance_data.plugin.fill_output_to_host_aspect = true;
                 }
                 if matches!(props.get_resolve_page().as_deref(), Ok("Fusion")) {
                     instance_data.is_fusion_page = true;
@@ -582,25 +583,6 @@ impl Execute for GyroflowPlugin {
                             instance_data.trim_query_auto = true;
                             instance_data.last_trim_query = Some(std::time::Instant::now());
                             CurrentFileInfo::query(instance_data.current_file_info.clone(), instance_data.current_file_info_pending.clone(), true);
-                        }
-                        if !instance_data.supports_output_size {
-                            // Read the video dimensions right away: Resolve queries the output
-                            // RoD before the first render, and it must already report the
-                            // source's natural size at that point
-                            let url = filesystem::path_to_url(&path);
-                            if let Ok(mut file) = filesystem::open_file(&url, false, false) {
-                                let filesize = file.size;
-                                if let Ok(md) = gyroflow_core::util::get_video_metadata(file.get_file(), filesize, &url) {
-                                    let mut size = (md.width as usize, md.height as usize);
-                                    if md.rotation.abs() == 90 || md.rotation.abs() == 270 {
-                                        size = (size.1, size.0);
-                                    }
-                                    if size.0 > 0 && size.1 > 0 {
-                                        log::info!("CreateInstance: source video size: {size:?}, rotation: {}", md.rotation);
-                                        instance_data.plugin.original_video_size = size;
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -641,21 +623,12 @@ impl Execute for GyroflowPlugin {
                 let instance_data = effect.get_instance_data::<InstanceData>()?;
                 let rod = instance_data.source_clip.get_region_of_definition(time)?;
                 if !instance_data.supports_output_size {
-                    // Resolve Edit/Color pages: report the source video's natural dimensions
-                    // (the clip's RoD reported by the host is already timeline-sized there),
-                    // so Resolve composes and scales the stabilized clip exactly like an
-                    // unstabilized one — no stretching, no baked-in letterbox/pillarbox bars,
-                    // and the Inspector zoom/framing controls work natively
-                    let mut out_rod = rod;
-                    let video_size = instance_data.plugin.original_video_size;
-                    if video_size.0 > 0 && video_size.1 > 0 {
-                        out_rod.x1 = 0.0;
-                        out_rod.y1 = 0.0;
-                        out_rod.x2 = video_size.0 as f64;
-                        out_rod.y2 = video_size.1 as f64;
-                    }
-                    log::debug!("GetRegionOfDefinition: time: {time}, source rod: {:?}, returning: {:?}", (rod.x1, rod.y1, rod.x2, rod.y2), (out_rod.x1, out_rod.y1, out_rod.x2, out_rod.y2));
-                    out_args.set_effect_region_of_definition(out_rod)?;
+                    // Resolve Edit/Color pages: buffers are always timeline-sized and Resolve
+                    // doesn't consult this action in practice (verified with logging) — the
+                    // output fills the frame with a timeline-aspect crop of the source, so
+                    // just pass the host-reported RoD through
+                    log::debug!("GetRegionOfDefinition: time: {time}, source rod: {:?}", (rod.x1, rod.y1, rod.x2, rod.y2));
+                    out_args.set_effect_region_of_definition(rod)?;
                     return OK;
                 }
                 let mut out_rod = rod;

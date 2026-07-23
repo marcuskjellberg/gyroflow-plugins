@@ -388,10 +388,12 @@ pub struct GyroflowPluginBaseInstance {
     pub framebuffer_inverted: bool,
     pub anamorphic_adjust_size: bool,
     pub always_set_input_rotation: bool,
-    /// Always stabilize into the source video dimensions, ignoring timeline/project output
-    /// sizes (used on Resolve Edit/Color pages, where the plugin should behave like a native
-    /// clip: output at the source's natural size and let the host do all scaling/framing).
-    pub force_source_output_size: bool,
+    /// Fill the host's frame: derive the output size from the host frame's aspect ratio,
+    /// as the largest crop that fits within the source video (used on Resolve Edit/Color
+    /// pages, where buffers are always timeline-sized — the stabilizer produces a
+    /// timeline-aspect crop of the source, so there are no bars and no stretching, and
+    /// adaptive zoom gets the cropped-away headroom to stabilize into).
+    pub fill_output_to_host_aspect: bool,
 
     pub opencl_disabled: bool,
 }
@@ -412,7 +414,7 @@ impl Clone for GyroflowPluginBaseInstance {
             framebuffer_inverted:           self.framebuffer_inverted,
             anamorphic_adjust_size:         self.anamorphic_adjust_size,
             always_set_input_rotation:      self.always_set_input_rotation,
-            force_source_output_size:       self.force_source_output_size,
+            fill_output_to_host_aspect:     self.fill_output_to_host_aspect,
             keyframable_params:             Arc::new(RwLock::new(self.keyframable_params.read().clone())),
         }
     }
@@ -434,7 +436,7 @@ impl Default for GyroflowPluginBaseInstance {
             framebuffer_inverted:           false,
             anamorphic_adjust_size:         true,
             always_set_input_rotation:      false,
-            force_source_output_size:       false,
+            fill_output_to_host_aspect:     false,
             keyframable_params: Arc::new(RwLock::new(KeyframableParams {
                 use_gyroflows_keyframes:  false, // TODO param_set.parameter::<Bool>("UseGyroflowsKeyframes")?.get_value()?,
                 cached_keyframes:         KeyframeManager::default()
@@ -695,14 +697,11 @@ impl GyroflowPluginBaseInstance {
                 }
             }
 
-            if self.force_source_output_size {
-                // Behave like a native clip: stabilize into the source video dimensions and
-                // let the host do all scaling/framing. This also prevents reduced-resolution
-                // (proxy) buffer sizes from getting baked into the output size.
-                let size = stab.params.read().size;
-                if size.0 > 0 && size.1 > 0 {
-                    stab.params.write().output_size = size;
-                }
+            if self.fill_output_to_host_aspect && out_size.0 > 0 && out_size.1 > 0 {
+                // Fill the host frame: `set_output_size` keeps the requested aspect ratio and
+                // scales it to the largest crop that fits within the source (rotation-aware),
+                // so the result is independent of reduced-resolution (proxy) buffer sizes.
+                stab.set_output_size(out_size.0 as _, out_size.1 as _);
             }
 
             let loaded = {
@@ -842,11 +841,10 @@ impl GyroflowPluginBaseInstance {
             }
 
             stab.init_size();
-            if self.force_source_output_size {
+            if self.fill_output_to_host_aspect && out_size.0 > 0 && out_size.1 > 0 {
                 // Ignore the OutputWidth/OutputHeight params (disabled on these pages, and
-                // possibly stale from older sessions) — the output is always the source size
-                let size = stab.params.read().size;
-                stab.set_output_size(size.0 as _, size.1 as _);
+                // possibly stale from older sessions) — always fill the host frame's aspect
+                stab.set_output_size(out_size.0 as _, out_size.1 as _);
             } else {
                 stab.set_output_size(params.get_f64(Params::OutputWidth)? as _, params.get_f64(Params::OutputHeight)? as _);
             }
