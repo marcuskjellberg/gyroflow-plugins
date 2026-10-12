@@ -1,0 +1,31 @@
+[package]
+name = "gyroflow-ofx-simple"
+version = "0.1.0"
+authors = ["Adrian <adrian.eddy@gmail.com>", "Ilya Epifanov <elijah.epifanov@gmail.com>"]
+license = "GPL-3.0-or-later"
+edition = "2024"
+description = "Simplified Gyroflow OpenFX plugin for DaVinci Resolve"
+build = "build.rs"
+
+[lib]
+name = "gyroflow_ofx_simple"
+crate-type = ["cdylib"]
+
+[dependencies]
+gyroflow-plugin-base = { path = "../common", default-features = false }
+ofx = "0.3"
+log = "0.4"
+regex = "1.12"
+
+[build-dependencies]
+winres = "0.1"
+
+[patch.crates-io]
+ofx = { git = "https://github.com/AdrianEddy/ofx-rs.git", rev = "0b15219" }
+ofx_sys = { git = "https://github.com/AdrianEddy/ofx-rs.git", rev = "0b15219" }
+
+[profile.deploy]
+inherits = "release"
+codegen-units = 1
+lto = true
+strip = true

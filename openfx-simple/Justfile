@@ -1,0 +1,21 @@
+TargetDir := env_var_or_default("CARGO_TARGET_DIR", "../target")
+
+# Local development build (macOS): native arch only, ad-hoc signed
+[macos]
+dev:
+    #!/bin/bash
+    set -e
+
+    cargo build --release
+
+    cd "{{TargetDir}}"
+    rm -rf gyroflow-ofx-simple-dev/GyroflowSimple.ofx.bundle
+    mkdir -p gyroflow-ofx-simple-dev/GyroflowSimple.ofx.bundle/Contents/MacOS
+    cp release/libgyroflow_ofx_simple.dylib gyroflow-ofx-simple-dev/GyroflowSimple.ofx.bundle/Contents/MacOS/GyroflowSimple.ofx
+    cp "{{justfile_directory()}}/res/Info.plist" gyroflow-ofx-simple-dev/GyroflowSimple.ofx.bundle/Contents/
+
+    codesign -f -s - --deep gyroflow-ofx-simple-dev/GyroflowSimple.ofx.bundle
+    echo ""
+    echo "Dev bundle ready: {{TargetDir}}/gyroflow-ofx-simple-dev/GyroflowSimple.ofx.bundle"
+    echo "Install with (does not touch the existing Gyroflow.ofx.bundle):"
+    echo "  sudo cp -R {{TargetDir}}/gyroflow-ofx-simple-dev/GyroflowSimple.ofx.bundle /Library/OFX/Plugins/"

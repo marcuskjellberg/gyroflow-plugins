@@ -9,9 +9,14 @@ pub use gyroflow_core;
 
 // re-exports
 pub use rfd;
+pub mod cameras;
+
 pub use parking_lot;
 pub use lru;
 
+// Two copies of mimalloc in one process (e.g. two Gyroflow OFX plugins loaded by Resolve) crash,
+// so plugins that load alongside another one build without this feature.
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
