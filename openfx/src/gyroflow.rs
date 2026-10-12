@@ -140,14 +140,12 @@ struct InstanceData {
     file_path: Option<String>,
     /// The source video path of this instance (kept for matching scripting-query results)
     video_path: Option<String>,
-    /// Trim of the timeline item queried from Resolve's scripting API:
-    /// (left offset into the source media, duration), in frames
+    /// Trim of the timeline item being rendered: (start in the source media, duration), in source frames
     resolve_trim: Option<(f64, f64)>,
-    /// The pending scripting query was automatic (not user-initiated):
-    /// only consume the trim info from it, don't touch the project path
-    trim_query_auto: bool,
-    /// When the last automatic trim query was issued (rate-limits re-queries)
-    last_trim_query: Option<std::time::Instant>,
+    /// Source ranges of all timeline items using this video, from Resolve's scripting API (None while pending)
+    source_ranges: Arc<Mutex<Option<Vec<(f64, f64)>>>>,
+    /// When the source ranges were last queried (rate-limits re-queries)
+    last_range_query: Option<std::time::Instant>,
 
     current_file_info_pending: Arc<AtomicBool>,
     current_file_info: Arc<Mutex<Option<CurrentFileInfo>>>,
@@ -192,24 +190,6 @@ impl InstanceData {
             self.current_file_info_pending.store(false, SeqCst);
             let lock = self.current_file_info.lock();
             if let Some(ref current_file) = *lock {
-                // Consume the timeline item's trim, but only if the queried item plays
-                // this instance's video (the scripting API returns whatever is under the
-                // playhead, which can be a different clip)
-                if let Some(trim) = current_file.trim_frames {
-                    let matches = self.video_path.as_deref().map(|p| p == current_file.file_path).unwrap_or(true);
-                    if matches {
-                        if self.resolve_trim != Some(trim) {
-                            log::info!("Timeline item trim from Resolve: left offset {} frames, duration {} frames", trim.0, trim.1);
-                            self.resolve_trim = Some(trim);
-                        }
-                    } else {
-                        log::info!("Ignoring trim of a different timeline item: {} != {:?}", current_file.file_path, self.video_path);
-                    }
-                }
-                if self.trim_query_auto {
-                    self.trim_query_auto = false;
-                    return Ok(false);
-                }
                 if let Some(proj) = &current_file.project_path {
                     self.params.set_string(Params::ProjectPath, proj).map_err(|e| {
                         log::error!("Failed to set project path: {e}");
@@ -226,6 +206,40 @@ impl InstanceData {
             }
         }
         Ok(false)
+    }
+
+    fn query_source_ranges(&mut self) {
+        let Some(path) = self.video_path.clone() else { return };
+        if self.supports_output_size || !CurrentFileInfo::is_available() { return; }
+        self.last_range_query = Some(std::time::Instant::now());
+        SourceRanges::query(path, self.source_ranges.clone());
+    }
+
+    /// Picks the trim of the timeline item that plays `src_frame`. Several cuts of the same
+    /// video share one query result; the rendered source frame tells which cut this is.
+    fn select_trim(&mut self, src_frame: Option<i64>) {
+        let Some(src_frame) = src_frame else { return };
+        let ranges = self.source_ranges.lock().clone();
+        let Some(ranges) = ranges else { return }; // Query pending
+        match SourceRanges::containing(&ranges, src_frame as f64) {
+            Some((start, end)) => {
+                let trim = (start, end - start);
+                if self.resolve_trim != Some(trim) {
+                    log::info!("Timeline item for source frame {src_frame}: source frames {start}..{end}");
+                    self.resolve_trim = Some(trim);
+                }
+            }
+            None => {
+                // An empty list means Resolve doesn't expose this item (e.g. compound clip): don't keep asking
+                if ranges.is_empty() { return; }
+                // The timeline was edited since the query: use the whole clip until the new answer
+                self.resolve_trim = None;
+                if self.last_range_query.map_or(true, |t| t.elapsed().as_secs_f64() > 5.0) {
+                    log::info!("Source frame {src_frame} is in none of {ranges:?}, querying again");
+                    self.query_source_ranges();
+                }
+            }
+        }
     }
 }
 
@@ -267,6 +281,9 @@ impl Execute for GyroflowPlugin {
 
                 let output_rect: RectI = output_image.get_region_of_definition()?;
 
+                let src_frame = in_args.get_src_frame().ok().map(|f| f as i64);
+                instance_data.select_trim(src_frame);
+
                 let stab = instance_data.stab_manager(&self.gyroflow_plugin.manager_cache, output_rect, loading_pending_video_file)?;
 
                 if !instance_data.supports_output_size {
@@ -294,7 +311,9 @@ impl Execute for GyroflowPlugin {
                     (md.has_accurate_timestamps, !gyro.get_offsets().is_empty())
                 };
 
-                if (src_fps - fps).abs() > 0.01 {
+                // With a source frame from Resolve the timestamps are exact, so a timeline running at
+                // a different frame rate than the clip is fine there (see DEVELOPMENT.md)
+                if (src_fps - fps).abs() > 0.01 && src_frame.is_none() {
                     instance_data.plugin.set_status(&mut instance_data.params, "Timeline fps mismatch!", "Timeline frame rate doesn't match the clip frame rate! Use the plugin in Fusion instead", false);
                 } else if !has_accurate_timestamps && !has_offsets {
                     instance_data.plugin.set_status(&mut instance_data.params, "Not synced. Open in Gyroflow", "Gyro data is not synced with the video, open the video in Gyroflow and add sync points (eg. by doing autosync)", false);
@@ -303,7 +322,6 @@ impl Execute for GyroflowPlugin {
                 }
 
                 let frame_range = instance_data.source_clip.get_frame_range().ok().map(|r| (r.min, r.max));
-                let src_frame = in_args.get_src_frame().ok().map(|f| f as i64);
                 let duration_ms = params.duration_ms;
 
                 let computed = crate::timestamp::compute_timestamp(&crate::timestamp::TimeParams {
@@ -326,21 +344,6 @@ impl Execute for GyroflowPlugin {
                 // gyroflow-core, so that adaptive zoom is solved over the visible sub-clip
                 // instead of the whole source recording — just like trimming in the Gyroflow app.
                 if duration_ms > 0.0 && fps > 0.0 {
-                    // Sanity check: the source frames actually rendered must lie inside the
-                    // queried trim, otherwise the query hit a different timeline item
-                    if let (Some((left, len)), Some(sf)) = (instance_data.resolve_trim, src_frame) {
-                        let sf = sf as f64;
-                        if sf + 3.0 < left || sf > left + len + 3.0 {
-                            log::info!("Rendered source frame {sf} is outside the queried trim ({left} + {len} frames) — discarding trim info");
-                            instance_data.resolve_trim = None;
-                            // The trim likely changed (e.g. the clip was extended) — re-query it
-                            if CurrentFileInfo::is_available() && instance_data.last_trim_query.map(|t| t.elapsed().as_secs_f64() > 3.0).unwrap_or(true) {
-                                instance_data.trim_query_auto = true;
-                                instance_data.last_trim_query = Some(std::time::Instant::now());
-                                CurrentFileInfo::query(instance_data.current_file_info.clone(), instance_data.current_file_info_pending.clone(), true);
-                            }
-                        }
-                    }
                     if let Some((left_frames, len_frames)) = instance_data.resolve_trim {
                         let start_ms = (left_frames / fps * 1000.0).max(0.0);
                         let end_ms = (((left_frames + len_frames) / fps) * 1000.0).min(duration_ms);
@@ -539,8 +542,8 @@ impl Execute for GyroflowPlugin {
                     file_path: None,
                     video_path: None,
                     resolve_trim: None,
-                    trim_query_auto: false,
-                    last_trim_query: None,
+                    source_ranges: Arc::new(Mutex::new(None)),
+                    last_range_query: None,
                     params: ParamHandler {
                         instance_id:              param_set.parameter("InstanceId")?,
                         project_data:             param_set.parameter("ProjectData")?,
@@ -626,15 +629,8 @@ impl Execute for GyroflowPlugin {
                     if !path.is_empty() {
                         instance_data.file_path = Some(path.clone());
                         instance_data.video_path = Some(path.clone());
-                        if !instance_data.supports_output_size && CurrentFileInfo::is_available() {
-                            // Query the timeline item's trim from Resolve's scripting API
-                            // (async; the result is consumed on the next render). Resolve
-                            // recreates the effect instance when the clip is re-trimmed, so
-                            // this picks up trim changes as they happen.
-                            instance_data.trim_query_auto = true;
-                            instance_data.last_trim_query = Some(std::time::Instant::now());
-                            CurrentFileInfo::query(instance_data.current_file_info.clone(), instance_data.current_file_info_pending.clone(), true);
-                        }
+                        // Resolve recreates the instance when the clip is re-trimmed, so this picks up trim changes
+                        instance_data.query_source_ranges();
                     }
                 }
 
@@ -643,6 +639,10 @@ impl Execute for GyroflowPlugin {
                 OK
             }
             InstanceChanged(ref mut effect, ref mut in_args) => {
+                // Sent synchronously from CreateInstance, before the instance data exists
+                if in_args.get_name()? == "InstanceId" {
+                    return OK;
+                }
                 let instance_data: &mut InstanceData = effect.get_instance_data()?;
                 if in_args.get_name()? == "LoadCurrent" {
                     CurrentFileInfo::query(instance_data.current_file_info.clone(), instance_data.current_file_info_pending.clone(), false);
