@@ -2,8 +2,8 @@ extern crate ofx;
 
 use ofx::*;
 
+mod crop;
 mod gyroflow;
-mod fuscript;
 mod simple;
 mod timestamp;
 

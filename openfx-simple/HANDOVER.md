@@ -1,66 +1,54 @@
-# Gyroflow Simple (OpenFX) — handover
+# Gyroflow Simple (OpenFX) handover
 
-## Where things are
-- Branch: `feature/simple-plugin` (from `feature/resolve-trim-and-aspect`). Nothing committed yet.
-- Existing plugin (`openfx/`) is unchanged in behavior. It runs on the newer Gyroflow core because `common/` is pinned to `79765f4`.
-- New plugin: `openfx-simple/`. Bundle name `GyroflowSimple.ofx.bundle`, identifier `xyz.gyroflow.simple.ofx`, effect label "Gyroflow Simple".
-- Camera table: `common/src/cameras.rs`. MISSION 1 PRO (Linear has our calibrated profile embedded from `common/res/lens_profiles/`; Wide has none). Osmo Nano is a placeholder.
+## Scope
 
-## Spec (what the simple plugin does)
-Goal: as much stabilization as possible without cropping below 1080p detail, with almost no settings.
+- Resolve Studio on macOS, initially GoPro MISSION 1 PRO Linear with a 4000x3000 (4:3) source at any frame rate and EIS setting. The bundled calibration in `common/res/lens_profiles/` was measured at 23.98 fps without EIS; EIS-on footage is accepted but its geometric accuracy has not been validated. Wide and 16:9 source modes have no bundled calibration and pass through.
+- Bundle: `GyroflowSimple.ofx.bundle`; identifier: `xyz.gyroflow.simple.ofx`. The existing `openfx/` plugin keeps its own project workflow.
+- Simple loads source-video metadata and embedded gyro directly through the pinned Gyroflow core. It does not run fuscript, launch the Gyroflow app, import `.gyroflow` projects or presets, or consult the installed lens-profile database. Its cache entries are separate from the legacy plugin's.
+- Unsupported or unsynchronized clips show a pass-through reason. CPU renders copy the source; after an unsupported render, `IsIdentity` requests host pass-through. Check this behavior in Resolve before release.
 
-Panel (everything else hidden, IDs kept so projects stay compatible):
-| Control | Range | Default | Maps to |
-|---|---|---|---|
-| Stabilization | 0–100 | 85 | core smoothness 0.001–1.0 (Default algorithm) |
-| Horizon level | 0–1 | 0.9 | horizon lock amount 0–100% |
-| Flip 180° | on/off | off | hidden Rotation 0/180 |
-| Reframe X / Y | ±100 | 0 | zoom-center offset; ±100 = frame touches the source edge at the zoom limit |
-| Stabilization overview | on/off | off | shared param |
+## Panel
 
-Fixed engine settings (`openfx-simple/src/simple.rs`, independent of presets saved by the Gyroflow app):
-- Zoom limit = the zoom that keeps 1920×1080 of source detail visible: `min(long/1920, short/1080)` of the output crop, clamped to 115–400%. 4000×3000 GoPro in a 16:9 timeline: 4000×2250 crop → 208%.
-- Max-zoom limiter runs 15 iterations (core default 5 often stopped above the limit). When a moment would need more zoom, that moment gets less smoothing instead.
-- Dynamic zoom (4 s window, envelope follower): zooms in only around shaky moments.
-- Applied through the plugin's keyframe cache (`SmoothingParamSmoothness`, `LockHorizonAmount`, `MaxZoom`) every render; a change triggers one blocking recompute.
-- Status shows `OK · zoom up to N%`.
+| Control | Default | Behavior |
+|---|---|---|
+| Stabilization | 85 | Core smoothing; the crop solver zooms as needed to keep every rendered pixel inside the source |
+| Horizon level | 0.9 | Core horizon lock |
+| Flip 180 degrees | off | Manual video rotation through a core keyframe; no automatic inversion detection |
+| Zoom response (s) | 4 | Time the crop takes to zoom by 2x, 0.2 to 8 seconds; longer values are gentler but zoom in earlier around shakes |
+| Reframe X / Y | 0 | Offset the frame center by up to 2% of source size per axis; the crop solver adds the extra crop required |
+| View | Normal | Overview zooms out and draws the per-frame crop bound in rendered pixels (also exported) |
 
-Trim (`SourceRanges` in `fuscript.rs`): one scripting query lists the source range of every timeline item using this file (no dependency on the playhead, which caused `attempt to index a nil value`). The rendered source frame picks the right cut. Re-queries only if the frame is in none of the ranges (5 s rate limit), never when Resolve reports no items. Results are shared between instances for 2 s, and all fuscript calls are serialized (concurrent calls are the suspected cause of a Resolve crash).
+The old Crop priority remains defined but hidden for saved-project compatibility; it no longer limits zoom. Parameter changes trigger a new solve in Render, so no separate recalculate button is needed.
 
-Verified offline on GX010636 (`real_clip_zoom_stays_within_limit`, ignored test): max zoom 100.9% at Stabilization 0, 171.9% at 50, 207.0% at 85/0.9, 206.6% at 100/1.0 — always under the 208.3% limit.
+### Crop solver (`src/crop.rs`)
 
-## History / fixes
-- mimalloc is an optional feature of `common`; the simple plugin builds without it (two copies crashed Resolve).
-- Trim queries use source frames (`GetSourceStartFrame`/`GetSourceEndFrame`), not timeline frames. The original plugin still has the timeline-frame bug.
-- "Timeline fps mismatch!" only shows when Resolve gives no source frame.
-- Core setters like `set_zooming_center_*` only do a non-blocking invalidation; the plugin must call `invalidate_blocking_*` or nothing changes until another setting does.
-- Resolve sends `InstanceChanged("InstanceId")` synchronously inside CreateInstance, before the instance data exists. It's ignored; touching instance data there crashed Resolve.
-- Flip with horizon lock on already-upright footage flickers ±45°. Not a target use case.
-- Diagnostic log lines (keep until verified): `InstanceChanged`, `Flip 180`, `Reframe`, `Applying Settings`, `Zoom solved`, `Timeline items using`, `Timeline item for source frame`.
+The crop is a constrained optimization, solved by the plugin instead of the core's adaptive zoom:
 
-## Still open
-1. Verified in Resolve (12 Oct): new panel works, trim is picked up per cut, zoom stays under the limit, no crashes. On a 16:9 timeline the output stays a 16:9 crop of the 4:3 source (chosen over pillarboxed 4:3; a 4:3 timeline keeps the full frame).
-2. Stabilization overview: draw the timeline frame over the 4:3 source.
-3. Standalone check: run on a machine/user without the Gyroflow app.
-4. Upside-down auto-detection from GRAV (needs an inverted sample clip).
-5. Wide lens profile and DJI Osmo Nano profile.
-6. Resolve hands the plugin a timeline-resolution buffer (1920×1080 on a 1080p timeline), so source detail is already reduced before stabilization. Not fixable on the Edit page.
+1. Per frame, the bound is the largest rectangle of the timeline's aspect, centred on the reframe offset, inside the stabilized outline of the 4000x3000 source. The outline is inset by the interpolation kernel's reach at the host buffer's scale: Lanczos4 reads 4 buffer pixels past a sample, about 11 source pixels in Resolve's 1440x1080 pillarbox. The rectangle-to-outline distance is computed exactly per outline segment.
+2. Over time, the zoom is the largest curve under those bounds that changes by at most 2x per response time: `ln f(t) = min_s (ln F(s) + r|t - s|)`. A moving minimum and moving average over response/8 then ease its corners without exceeding it.
+3. Every frame of the curve is checked with the renderer's own map (`Stabilization::undistort_coord`) at 16-pixel spacing along the frame edge and on an interior grid. A failing frame's bound is bisected and the curve solved again. The rectangles are nested, so a frame that passes also holds at any smaller zoom.
 
-## Known issues
-- "Path is empty" errors appear at instance start. The original plugin shows the same errors, so they may be normal startup.
+The solve covers the timeline item's frames, derived from Resolve's source frame and the effect's frame range, and widens if a frame outside them is rendered; without a source frame it covers the whole clip. It is keyed on the settings, the frame range and the margin, so a host buffer of another size gets its own solve. The previous 1% FOV inset and the core's 3 px margin were not a guarantee: with Lanczos4 on a 1080p timeline, kernel taps reached past the source area.
 
-## Build and install
+The source aspect and timeline aspect are distinct: a supported 4:3 source can be stabilized on a 16:9 Resolve timeline, though the host may supply only a cropped frame. Overview only shows the source area supplied by the host. On Resolve Edit/Color, buffers are timeline-sized and may already be cropped to the timeline aspect; the plugin cannot reveal missing 4:3 or offscreen source pixels. The outline is a rendered diagnostic, not a separate UI overlay.
+
+## Verification
+
+From `gyroflow-plugins/`:
+
 ```bash
-cd ~/Developer/Gyroflow/gyroflow-plugins/openfx-simple && CARGO_TARGET_DIR=../target just dev
-sudo rm -rf /Library/OFX/Plugins/GyroflowSimple.ofx.bundle && sudo cp -R ~/Developer/Gyroflow/gyroflow-plugins/target/gyroflow-ofx-simple-dev/GyroflowSimple.ofx.bundle /Library/OFX/Plugins/
+CARGO_TARGET_DIR=target cargo test --release --manifest-path common/Cargo.toml
+CARGO_TARGET_DIR=target cargo test --release --manifest-path openfx-simple/Cargo.toml
+CARGO_TARGET_DIR=target cargo test --release --manifest-path openfx/Cargo.toml
+CARGO_TARGET_DIR=target cargo fmt --all --check
+just -f openfx-simple/Justfile dev
 ```
-Unit tests: `cd openfx-simple && CARGO_TARGET_DIR=../target cargo test --release` (and the same in `common`).
-Real-clip check: `GF_TEST_VIDEO=/path/to/GX010636.MP4 CARGO_TARGET_DIR=../target cargo test --release real_clip -- --ignored --nocapture` in `openfx-simple`.
 
-## Backups
-- Original plugin: `~/Desktop/Gyroflow.ofx.bundle.backup`.
+The ignored `real_clip_loads_without_project_or_external_lens` test needs `GF_TEST_VIDEO=/path/to/clip.MP4`; no test media is checked in. It runs the plugin's settings and crop solve the way the OFX instance does (inverted framebuffer, Lanczos4) at five settings, asserts that every frame passes the render check, and renders the six tightest frames plus an even spread into float buffers. In those buffers the 4:3 area is white inside opaque black bars, and the renderer's background is set to -1000 so any sample past the source area shows; 8-bit output would hide it, since the core truncates Lanczos sums of 254.99 to 254. Set `GF_TEST_FULL_RES=1` for Resolve's 1920x1080 buffers and `GF_TEST_ALL_FRAMES=1` to render every frame. In the October 2026 sample folder, all 62 calibrated recordings passed at 1920x1080 (310 solves). The outline bound never had to be lowered by the render check, the closest sample sat 0.04-0.05 px inside the kernel margin, peak zoom ran from 103% to 613%, and solves took up to 68 ms for 5242 frames. The three 16:9 recordings correctly passed through. GX010647 also passed with every frame rendered at all five settings. These checks use the CPU renderer with synthetic pixels; they do not cover Resolve's GPU paths or prove which source area Resolve supplies. Before shipping, test upright and inverted clips at different frame rates and EIS settings, and a Wide/unknown/no-gyro clip in Resolve. Verify calibration accuracy on EIS-on footage, CPU pass-through and `IsIdentity` on unsupported footage, and that Normal/Overview agree between preview and export at multiple source timestamps. Test both Edit/Color and Fusion where applicable. No release-ready claim is warranted until these host and real-media checks pass.
+
+Do not run the `just` install target without the user's approval; it modifies `/Library/OFX/Plugins`. The dev bundle is created under `target/gyroflow-ofx-simple-dev/`.
 
 ## Logs
-- Simple plugin: `~/Library/Application Support/Gyroflow/gyroflow-openfx-simple.log` (truncated each Resolve launch).
-- Original plugin: `~/Library/Application Support/Gyroflow/gyroflow-openfx.log`.
-- Crash reports: Resolve writes its own to `~/Library/Application Support/Blackmagic Design/DaVinci Resolve/crash_archive.txt` (macOS `.ips` reports often don't appear).
+
+- Simple: `~/Library/Application Support/Gyroflow/gyroflow-openfx-simple.log` (truncated on Resolve startup).
+- Legacy: `~/Library/Application Support/Gyroflow/gyroflow-openfx.log`.

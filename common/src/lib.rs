@@ -22,6 +22,24 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub type PluginResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+pub fn load_standalone_video(stab: &StabilizationManager, path: &str) -> PluginResult<gyroflow_core::telemetry_parser::util::VideoMetadata> {
+    let url = filesystem::path_to_url(path);
+    let mut file = filesystem::open_file(&url, false, false)?;
+    let filesize = file.size;
+    let metadata = gyroflow_core::util::get_video_metadata(file.get_file(), filesize, &url)?;
+    if metadata.width == 0 || metadata.height == 0 || metadata.duration_s <= 0.0 || metadata.fps <= 0.0 {
+        return Err("Invalid video metadata".into());
+    }
+    let size = (metadata.width as usize, metadata.height as usize);
+    let frame_count = (metadata.duration_s * metadata.fps).ceil() as usize;
+    stab.init_from_video_data(metadata.duration_s * 1000.0, metadata.fps, frame_count, size);
+    stab.lens_profile_db.write().loaded = true;
+    stab.load_gyro_data(file.get_file(), filesize, &url, true, &Default::default(), |_| (), Arc::new(AtomicBool::new(false)))?;
+    stab.set_size(size.0, size.1);
+    stab.set_output_size(size.0, size.1);
+    Ok(metadata)
+}
+
 #[derive(Debug, Copy, Clone, Hash, PartialEq, PartialOrd, Eq, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Params {
     Logo,
@@ -559,6 +577,14 @@ impl GyroflowPluginBaseInstance {
     }
 
     pub fn stab_manager_with_cache_context(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, out_size: (usize, usize), open_gyroflow_if_no_data: bool, cache_context: &str) -> PluginResult<Arc<StabilizationManager>> {
+        self.stab_manager_with_policy(params, manager_cache, out_size, open_gyroflow_if_no_data, cache_context, false)
+    }
+
+    pub fn stab_manager_standalone(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, out_size: (usize, usize), cache_context: &str) -> PluginResult<Arc<StabilizationManager>> {
+        self.stab_manager_with_policy(params, manager_cache, out_size, false, cache_context, true)
+    }
+
+    fn stab_manager_with_policy(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, out_size: (usize, usize), open_gyroflow_if_no_data: bool, cache_context: &str, standalone: bool) -> PluginResult<Arc<StabilizationManager>> {
         let mut disable_stretch = params.get_bool(Params::DisableStretch)?;
 
         let instance_id = params.get_string(Params::InstanceId)?;
@@ -567,12 +593,16 @@ impl GyroflowPluginBaseInstance {
             self.update_loaded_state(params, false);
             return Err("Path is empty".into());
         }
+        if standalone && path.to_ascii_lowercase().ends_with(".gyroflow") {
+            return Err("Only video files with embedded telemetry are supported".into());
+        }
 
         if self.timeline_size == (0, 0) {
             self.timeline_size = out_size;
         }
 
-        let key = manager_cache_key(&path, disable_stretch, &instance_id, cache_context);
+        let context = if standalone { format!("standalone:{cache_context}") } else { cache_context.to_owned() };
+        let key = manager_cache_key(&path, disable_stretch, &instance_id, &context);
         let cloned = manager_cache.lock().get(&key).map(Arc::clone);
         let stab = if let Some(stab) = cloned {
             // Cache it in this instance as well
@@ -584,7 +614,7 @@ impl GyroflowPluginBaseInstance {
         } else {
             log::info!("new stab manager for key: {key}");
             let mut stab = StabilizationManager::default();
-            {
+            if !standalone {
                 // Find first lens profile database with loaded profiles
                 let lock = manager_cache.lock();
                 for (_, v) in lock.iter() {
@@ -610,19 +640,24 @@ impl GyroflowPluginBaseInstance {
             }
 
             if !path.ends_with(".gyroflow") {
-                let url = filesystem::path_to_url(&path);
-                let mut file = filesystem::open_file(&url, false, false)?;
-                let filesize = file.size;
-                match stab.load_video_file(file.get_file(), filesize, &url, None, true) {
+                let video_result = if standalone {
+                    load_standalone_video(&stab, &path)
+                } else {
+                    let url = filesystem::path_to_url(&path);
+                    let mut file = filesystem::open_file(&url, false, false)?;
+                    let filesize = file.size;
+                    stab.load_video_file(file.get_file(), filesize, &url, None, true).map_err(Into::into)
+                };
+                match video_result {
                     Ok(md) => {
                         if out_size != (0, 0) {
                             stab.params.write().output_size = out_size; // Default to timeline output size
                         }
-                        if let Some(preset_out_size) = stab.input_file.read().preset_output_size {
+                        if !standalone { if let Some(preset_out_size) = stab.input_file.read().preset_output_size {
                             stab.params.write().output_size = preset_out_size;
-                        }
+                        } }
 
-                        if let Ok(d) = params.get_string(Params::EmbeddedLensProfile) {
+                        if !standalone { if let Ok(d) = params.get_string(Params::EmbeddedLensProfile) {
                             if !d.is_empty() {
                                 if let Err(e) = stab.load_lens_profile(&d) {
                                     rfd::MessageDialog::new()
@@ -630,8 +665,8 @@ impl GyroflowPluginBaseInstance {
                                         .show();
                                 }
                             }
-                        }
-                        if let Ok(d) = params.get_string(Params::EmbeddedPreset) {
+                        } }
+                        if !standalone { if let Ok(d) = params.get_string(Params::EmbeddedPreset) {
                             if !d.is_empty() {
                                 let mut is_preset = false;
                                 if let Err(e) = stab.import_gyroflow_data(d.as_bytes(), true, None, |_|(), Arc::new(AtomicBool::new(false)), &mut is_preset, true) {
@@ -640,14 +675,14 @@ impl GyroflowPluginBaseInstance {
                                         .show();
                                 }
                             }
-                        }
-                        if params.get_bool(Params::IncludeProjectData)? {
+                        } }
+                        if !standalone && params.get_bool(Params::IncludeProjectData)? {
                             if let Ok(data) = stab.export_gyroflow_data(gyroflow_core::GyroflowProjectType::WithGyroData, "{}", None) {
                                 let data = GyroflowPluginBase::maybe_inject_disable_stretch(&data, disable_stretch);
                                 params.set_string(Params::ProjectData, &data)?;
                             }
                         }
-                        if md.rotation != 0 && self.reload_values_from_project {
+                        if md.rotation != 0 && (standalone || self.reload_values_from_project) {
                             let r = ((360 - md.rotation) % 360) as f64;
                             params.set_f64(Params::InputRotation, r)?;
                             stab.params.write().video_rotation = r;
@@ -658,7 +693,7 @@ impl GyroflowPluginBaseInstance {
                         }
                     },
                     Err(e) => {
-                        let embedded_data = params.get_string(Params::ProjectData)?;
+                        let embedded_data = if standalone { String::new() } else { params.get_string(Params::ProjectData)? };
                         if !embedded_data.is_empty() {
                             let mut is_preset = false;
                             stab.import_gyroflow_data(embedded_data.as_bytes(), true, None, |_|(), Arc::new(AtomicBool::new(false)), &mut is_preset, true).map_err(|e| {
@@ -728,7 +763,7 @@ impl GyroflowPluginBaseInstance {
                 self.num_frames = gf_params.frame_count;
                 self.fps = gf_params.fps;
                 let loaded = gf_params.duration_ms > 0.0;
-                if loaded && self.reload_values_from_project {
+                if loaded && self.reload_values_from_project && !standalone {
                     self.reload_values_from_project = false;
                     let smooth = stab.smoothing.read();
                     let smoothness = smooth.current().get_parameter("smoothness");
@@ -808,7 +843,7 @@ impl GyroflowPluginBaseInstance {
             self.update_loaded_state(params, loaded);
 
             // Check if loaded preset/project/lens data contains the plugin_disable_stretch flag
-            if !disable_stretch {
+            if !disable_stretch && !standalone {
                 let has_flag = |d: &str| -> bool {
                     serde_json::from_str::<serde_json::Value>(d).ok()
                         .and_then(|v| v.get("plugin_disable_stretch").and_then(|v| v.as_bool()))
@@ -867,11 +902,11 @@ impl GyroflowPluginBaseInstance {
 
             self.set_keyframe_provider(&stab);
 
-            if let Ok(im) = params.get_i32(Params::IntegrationMethod) {
+            if !standalone { if let Ok(im) = params.get_i32(Params::IntegrationMethod) {
                 let mut gyro = stab.gyro.write();
                 gyro.integration_method = im as usize;
                 gyro.apply_transforms();
-            }
+            } }
 
             stab.invalidate_smoothing();
             stab.recompute_blocking();

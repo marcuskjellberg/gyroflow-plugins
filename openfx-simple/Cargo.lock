@@ -1218,8 +1218,9 @@ version = "0.1.0"
 dependencies = [
  "gyroflow-plugin-base",
  "log",
+ "nalgebra 0.34.2",
  "ofx",
- "regex",
+ "rayon",
  "winres",
 ]
 

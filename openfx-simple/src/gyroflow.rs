@@ -1,8 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::SeqCst;
 use ofx::*;
-use super::fuscript::*;
 use super::simple;
 use gyroflow_plugin_base::*;
 use gyroflow_plugin_base::cameras;
@@ -55,21 +52,75 @@ fn image_layout(bounds: RectI, row_bytes: Int, depth: BitDepth) -> Option<(usize
     Some((width, height, stride))
 }
 
+fn copy_source_frame(source: &[u8], output: &mut [u8], source_size: (usize, usize, usize), output_size: (usize, usize, usize), depth: BitDepth) -> bool {
+    if source_size.0 != output_size.0 || source_size.1 != output_size.1 { return false; }
+    let bytes_per_pixel = match depth {
+        BitDepth::Byte => 4,
+        BitDepth::Short | BitDepth::Half => 8,
+        BitDepth::Float => 16,
+        BitDepth::None => return false,
+    };
+    let Some(row_length) = source_size.0.checked_mul(bytes_per_pixel) else { return false };
+    let Some(source_length) = source_size.2.checked_mul(source_size.1) else { return false };
+    let Some(output_length) = output_size.2.checked_mul(output_size.1) else { return false };
+    if source_size.2 < row_length || output_size.2 < row_length || source.len() < source_length || output.len() < output_length { return false; }
+    for row in 0..source_size.1 {
+        let src = row * source_size.2;
+        let dst = row * output_size.2;
+        output[dst..dst + row_length].copy_from_slice(&source[src..src + row_length]);
+    }
+    true
+}
+
+fn unsupported_reason(stab: &StabilizationManager) -> Option<&'static str> {
+    let gyro = stab.gyro.read();
+    if !gyro.has_motion() { return Some("No embedded gyro data"); }
+    if !gyro.file_metadata.read().has_accurate_timestamps && gyro.get_offsets().is_empty() {
+        return Some("Embedded gyro is not synchronized");
+    }
+    if stab.camera_id.read().as_ref().and_then(supported_lens).is_none() {
+        return Some("Only MISSION 1 PRO Linear 4000x3000 (4:3 source) is supported");
+    }
+    None
+}
+
+fn supported_lens(id: &gyroflow_core::camera_identifier::CameraIdentifier) -> Option<&'static cameras::LensMode> {
+    if !id.brand.eq_ignore_ascii_case("GoPro") || id.video_width != 4000 || id.video_height != 3000 {
+        return None;
+    }
+    cameras::predefined_lens_for(&id.model, &id.lens_info)
+}
+
+fn apply_orientation(stab: &StabilizationManager, keyframable: &RwLock<KeyframableParams>, flip: bool) -> bool {
+    let rotation = if flip { 180.0 } else { 0.0 };
+    let mut params = keyframable.write();
+    let current = params.cached_keyframes.value_at_video_timestamp(&KeyframeType::VideoRotation, 0.0);
+    if current == Some(rotation) && stab.params.read().video_rotation == rotation { return false; }
+    params.cached_keyframes.set(&KeyframeType::VideoRotation, 0, rotation);
+    drop(params);
+    stab.set_video_rotation(rotation);
+    stab.invalidate_blocking_smoothing();
+    true
+}
+
 /// Parameters shown in the simplified panel. Everything else keeps its ID and
 /// behavior but is hidden, so saved projects and the parameter mapping stay intact.
 const SIMPLE_VISIBLE: &[&str] = &[
     "ProjectGroup", "Status",
-    "AdjustGroup", "Stabilization", "HorizonLevel", "Flip180", "PositionX", "PositionY",
-    "ToggleOverview",
+    "AdjustGroup", "Stabilization", "HorizonLevel", "Flip180", "PositionX", "PositionY", "ZoomResponse",
+    "ViewMode",
 ];
 
 /// Controls handled by the simple plugin itself (see `simple.rs`); they replace the shared
 /// Smoothness, Horizon lock and Zoom limit controls, which stay hidden.
 fn simple_param_definitions() -> Vec<ParameterType> {
     vec![
-        ParameterType::Slider   { id: "Stabilization", label: "Stabilization", hint: "How smooth the camera motion is: 0 = off, 100 = maximum. The zoom never crops below 1080p detail; shaky moments that would need more get a little less smoothing instead", min: 0.0, max: 100.0, default: simple::DEFAULT_STABILIZATION },
+        ParameterType::Slider   { id: "Stabilization", label: "Stabilization", hint: "How smooth the camera motion is: 0 = off, 100 = maximum. Zoom crops as needed to keep the frame filled", min: 0.0, max: 100.0, default: simple::DEFAULT_STABILIZATION },
         ParameterType::Slider   { id: "HorizonLevel",  label: "Horizon level", hint: "Keep the horizon level: 0 = off, 1 = fully locked", min: 0.0, max: 1.0, default: simple::DEFAULT_HORIZON_LEVEL },
         ParameterType::Checkbox { id: "Flip180",       label: "Flip 180°",     hint: "Rotate the video 180° (for footage filmed upside down)", default: false },
+        ParameterType::Select   { id: "Quality",       label: "Crop priority", hint: "Trade source detail against stabilization strength", options: vec!["Preserve Detail", "Balanced", "Strong Stabilization"], default: "Balanced" },
+        ParameterType::Slider   { id: "ZoomResponse", label: "Zoom response (s)", hint: "Seconds the crop takes to zoom by 2x: longer values make zoom changes gentler but crop earlier around shakes", min: 0.2, max: 8.0, default: simple::DEFAULT_ZOOM_RESPONSE_S },
+        ParameterType::Select   { id: "ViewMode",      label: "View", hint: "Overview exports the visible source and output-frame boundary", options: vec!["Normal", "Overview"], default: "Normal" },
         ParameterType::Slider   { id: "PositionX",     label: "Reframe X",     hint: "Move the frame left or right inside the source", min: -100.0, max: 100.0, default: 0.0 },
         ParameterType::Slider   { id: "PositionY",     label: "Reframe Y",     hint: "Move the frame up or down inside the source",    min: -100.0, max: 100.0, default: 0.0 },
     ]
@@ -82,12 +133,13 @@ fn is_hidden_in_simple_panel(id: &str) -> bool {
 /// Swaps in the calibrated profile for a predefined camera (see `common/src/cameras.rs`).
 /// Does nothing if the loaded lens already is that profile, or if the camera is not predefined.
 fn apply_predefined_lens(stab: &StabilizationManager) {
-    let (camera_model, lens_model, identifier) = {
-        let lens = stab.lens.read();
-        (lens.camera_model.clone(), lens.lens_model.clone(), lens.identifier.clone())
-    };
-    let Some(mode) = cameras::predefined_lens_for(&camera_model, &lens_model) else { return };
-    if identifier == mode.identifier { return; }
+    let camera_id = stab.camera_id.read();
+    let Some(id) = camera_id.as_ref() else { return };
+    let Some(mode) = supported_lens(id) else { return };
+    let camera_model = id.model.clone();
+    let lens_model = id.lens_info.clone();
+    drop(camera_id);
+    if stab.lens.read().identifier == mode.identifier { return; }
     let Some(json) = mode.profile_json else { return };
     match stab.load_lens_profile(json) {
         Ok(_) => log::info!("Applied predefined lens profile for {camera_model} {lens_model}"),
@@ -180,29 +232,20 @@ struct InstanceData {
     supports_output_size: bool,
     is_fusion_page: bool,
     file_path: Option<String>,
-    /// The source video path of this instance (kept for matching scripting-query results)
-    video_path: Option<String>,
-    /// Trim of the timeline item being rendered: (start in the source media, duration), in source frames
-    resolve_trim: Option<(f64, f64)>,
-    /// Source ranges of all timeline items using this video, from Resolve's scripting API (None while pending)
-    source_ranges: Arc<Mutex<Option<Vec<(f64, f64)>>>>,
-    /// When the source ranges were last queried (rate-limits re-queries)
-    last_range_query: Option<std::time::Instant>,
-
-    current_file_info_pending: Arc<AtomicBool>,
-    current_file_info: Arc<Mutex<Option<CurrentFileInfo>>>,
+    unsupported_reason: Option<String>,
 
     stabilization: ParamHandle<Double>,
     horizon_level: ParamHandle<Double>,
+    zoom_response: ParamHandle<Double>,
+    view_mode: ParamHandle<Int>,
     flip_180: ParamHandle<bool>,
     position_x: ParamHandle<Double>,
     position_y: ParamHandle<Double>,
-    /// Log the solved zoom after the next render (set when something re-solves it)
-    log_zoom_after_render: bool,
+    crop: crate::crop::CropState,
 }
 
 impl InstanceData {
-    fn stab_manager(&mut self, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, output_rect: RectI, loading_pending_video_file: bool) -> Result<Arc<StabilizationManager>> {
+    fn stab_manager(&mut self, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, output_rect: RectI) -> std::result::Result<Arc<StabilizationManager>, String> {
         /*let source_rect = self.source_clip.get_region_of_definition(0.0)?;
         let mut source_rect = RectI {
             x1: source_rect.x1 as i32,
@@ -214,83 +257,23 @@ impl InstanceData {
             source_rect = self.source_clip.get_image(0.0)?.get_bounds()?;
         }
         let in_size = ((source_rect.x2 - source_rect.x1) as usize, (source_rect.y2 - source_rect.y1) as usize);*/
-        let width = usize::try_from(output_rect.x2.checked_sub(output_rect.x1).ok_or(Error::UnknownError)?).map_err(|_| Error::UnknownError)?;
-        let height = usize::try_from(output_rect.y2.checked_sub(output_rect.y1).ok_or(Error::UnknownError)?).map_err(|_| Error::UnknownError)?;
+        let width = usize::try_from(output_rect.x2.checked_sub(output_rect.x1).ok_or("Invalid output width")?).map_err(|_| "Invalid output width")?;
+        let height = usize::try_from(output_rect.y2.checked_sub(output_rect.y1).ok_or("Invalid output height")?).map_err(|_| "Invalid output height")?;
         if width == 0 || height == 0 {
-            return Err(Error::UnknownError);
+            return Err("Empty output frame".into());
         }
         let out_size = (width, height);
         let cache_context = if self.supports_output_size {
             String::new()
         } else {
             let divisor = greatest_common_divisor(width, height);
-            let trim = self.resolve_trim
-                .map(|(left, duration)| format!("{left:.3}:{duration:.3}"))
-                .unwrap_or_else(|| "none".to_string());
-            format!("trim:{trim}|aspect:{}:{}", width / divisor, height / divisor)
+            format!("aspect:{}:{}", width / divisor, height / divisor)
         };
 
-        self.plugin.stab_manager_with_cache_context(&mut self.params, manager_cache, out_size, loading_pending_video_file, &cache_context).map_err(|e| {
+        self.plugin.stab_manager_standalone(&mut self.params, manager_cache, out_size, &cache_context).map_err(|e| {
             log::error!("plugin.stab_manager error: {e:?}");
-            Error::UnknownError
+            e.to_string()
         })
-    }
-    pub fn check_pending_file_info(&mut self) -> Result<bool> { // -> is_video_file
-        if self.current_file_info_pending.load(SeqCst) {
-            self.current_file_info_pending.store(false, SeqCst);
-            let lock = self.current_file_info.lock();
-            if let Some(ref current_file) = *lock {
-                if let Some(proj) = &current_file.project_path {
-                    self.params.set_string(Params::ProjectPath, proj).map_err(|e| {
-                        log::error!("Failed to set project path: {e}");
-                        Error::UnknownError
-                    })?;
-                } else {
-                    // Try to use the video directly
-                    self.params.set_string(Params::ProjectPath, &current_file.file_path).map_err(|e| {
-                        log::error!("Failed to set source path: {e}");
-                        Error::UnknownError
-                    })?;
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    fn query_source_ranges(&mut self) {
-        let Some(path) = self.video_path.clone() else { return };
-        if self.supports_output_size || !CurrentFileInfo::is_available() { return; }
-        self.last_range_query = Some(std::time::Instant::now());
-        SourceRanges::query(path, self.source_ranges.clone());
-    }
-
-    /// Picks the trim of the timeline item that plays `src_frame`. Several cuts of the same
-    /// video share one query result; the rendered source frame tells which cut this is.
-    fn select_trim(&mut self, src_frame: Option<i64>) {
-        let Some(src_frame) = src_frame else { return };
-        let ranges = self.source_ranges.lock().clone();
-        let Some(ranges) = ranges else { return }; // Query pending
-        match SourceRanges::containing(&ranges, src_frame as f64) {
-            Some((start, end)) => {
-                let trim = (start, end - start);
-                if self.resolve_trim != Some(trim) {
-                    log::info!("Timeline item for source frame {src_frame}: source frames {start}..{end}");
-                    self.resolve_trim = Some(trim);
-                }
-            }
-            None => {
-                // An empty list means Resolve doesn't expose this item (e.g. compound clip): don't keep asking
-                if ranges.is_empty() { return; }
-                // Otherwise the timeline was edited since the query (cut moved or extended). Frames
-                // outside a trim aren't zoomed for, so fall back to the whole clip until the answer
-                self.resolve_trim = None;
-                if self.last_range_query.map_or(true, |t| t.elapsed().as_secs_f64() > 5.0) {
-                    log::info!("Source frame {src_frame} is in none of {ranges:?}, querying again");
-                    self.query_source_ranges();
-                }
-            }
-        }
     }
 }
 
@@ -315,13 +298,10 @@ impl Execute for GyroflowPlugin {
 
                 if let Some(path) = instance_data.file_path.take() {
                     let project_path = instance_data.params.get_string(Params::ProjectPath).unwrap_or_default();
-                    let new_project_path = gyroflow_plugin_base::GyroflowPluginBase::get_project_path(&path).unwrap_or(path);
-                    if project_path.is_empty() || project_path != new_project_path {
-                        let _ = instance_data.params.set_string(Params::ProjectPath, &new_project_path);
+                    if project_path != path {
+                        let _ = instance_data.params.set_string(Params::ProjectPath, &path);
                     }
                 }
-
-                let loading_pending_video_file = instance_data.check_pending_file_info()?;
 
                 let output_image = if in_args.get_opengl_enabled().unwrap_or_default() {
                     instance_data.output_clip.load_texture_mut(time, None)?
@@ -333,24 +313,58 @@ impl Execute for GyroflowPlugin {
                 let output_rect: RectI = output_image.get_region_of_definition()?;
 
                 let src_frame = in_args.get_src_frame().ok().map(|f| f as i64);
-                instance_data.select_trim(src_frame);
-
-                let stab = instance_data.stab_manager(&self.gyroflow_plugin.manager_cache, output_rect, loading_pending_video_file)?;
+                let stab_result = instance_data.stab_manager(&self.gyroflow_plugin.manager_cache, output_rect);
+                let reason = stab_result.as_ref().err().cloned().or_else(|| stab_result.as_ref().ok().and_then(|stab| unsupported_reason(stab).map(str::to_owned)));
+                if let Some(reason) = reason {
+                    instance_data.unsupported_reason = Some(reason.clone());
+                    instance_data.plugin.set_status(&mut instance_data.params, &format!("Pass-through: {reason}"), &reason, false);
+                    let source_image = if in_args.get_opengl_enabled().unwrap_or_default() {
+                        instance_data.source_clip.load_texture(time, None)?
+                    } else {
+                        instance_data.source_clip.get_image(time)?
+                    };
+                    let source_size = image_layout(source_image.get_bounds()?, source_image.get_row_bytes()?, source_image.get_pixel_depth()?);
+                    let output_size = image_layout(output_image.get_bounds()?, output_image.get_row_bytes()?, output_image.get_pixel_depth()?);
+                    if let (Some(source_size), Some(output_size)) = (source_size, output_size) {
+                        if source_image.get_pixel_depth()? == output_image.get_pixel_depth()? && !in_args.get_metal_enabled().unwrap_or_default() && !in_args.get_opengl_enabled().unwrap_or_default() && !in_args.get_opencl_enabled().unwrap_or_default() {
+                            let source_ptr = source_image.get_data()? as *const u8;
+                            let output_ptr = output_image.get_data()? as *mut u8;
+                            if !source_ptr.is_null() && !output_ptr.is_null() {
+                                if std::ptr::eq(source_ptr, output_ptr.cast_const()) && source_size == output_size { return OK; }
+                                let source_len = source_size.2.checked_mul(source_size.1).ok_or(Error::UnknownError)?;
+                                let output_len = output_size.2.checked_mul(output_size.1).ok_or(Error::UnknownError)?;
+                                let source_end = (source_ptr as usize).checked_add(source_len).ok_or(Error::UnknownError)?;
+                                let output_end = (output_ptr as usize).checked_add(output_len).ok_or(Error::UnknownError)?;
+                                let overlaps = (source_ptr as usize) < output_end && (output_ptr as usize) < source_end;
+                                let source_copy = if overlaps { Some(unsafe { std::slice::from_raw_parts(source_ptr, source_len).to_vec() }) } else { None };
+                                let source = source_copy.as_deref().unwrap_or_else(|| unsafe { std::slice::from_raw_parts(source_ptr, source_len) });
+                                let output = unsafe { std::slice::from_raw_parts_mut(output_ptr, output_len) };
+                                let copied = copy_source_frame(source, output, source_size, output_size, source_image.get_pixel_depth()?);
+                                if copied { return OK; }
+                            }
+                        }
+                    }
+                    log::error!("Unable to pass through unsupported frame: {reason}");
+                    return FAILED;
+                }
+                instance_data.unsupported_reason = None;
+                let stab = stab_result.map_err(|_| Error::UnknownError)?;
                 apply_predefined_lens(&stab);
+                apply_orientation(&stab, &instance_data.plugin.keyframable_params, instance_data.flip_180.get_value().unwrap_or(false));
+                let overview = instance_data.view_mode.get_value().unwrap_or(0) == 1;
+                if stab.params.read().fov_overview != overview {
+                    stab.set_fov_overview(overview);
+                    stab.invalidate_blocking_undistortion();
+                }
                 let settings = {
-                    let output_crop = stab.params.read().output_size;
                     simple::Settings::new(
                         instance_data.stabilization.get_value().unwrap_or(simple::DEFAULT_STABILIZATION),
                         instance_data.horizon_level.get_value().unwrap_or(simple::DEFAULT_HORIZON_LEVEL),
-                        output_crop,
+                        instance_data.zoom_response.get_value().unwrap_or(simple::DEFAULT_ZOOM_RESPONSE_S),
                     )
                 };
-                if simple::apply(&stab, &instance_data.plugin.keyframable_params, &settings) {
-                    instance_data.log_zoom_after_render = true;
-                }
-                if simple::apply_position(&stab, instance_data.position_x.get_value().unwrap_or(0.0), instance_data.position_y.get_value().unwrap_or(0.0), settings.max_zoom_percent) {
-                    instance_data.log_zoom_after_render = true;
-                }
+                simple::apply(&stab, &instance_data.plugin.keyframable_params, &settings);
+                simple::apply_position(&stab, instance_data.position_x.get_value().unwrap_or(0.0), instance_data.position_y.get_value().unwrap_or(0.0));
 
                 if !instance_data.supports_output_size {
                     let _ = instance_data.params.output_width.set_enabled(false);
@@ -385,7 +399,7 @@ impl Execute for GyroflowPlugin {
                     instance_data.plugin.set_status(&mut instance_data.params, "Not synced. Open in Gyroflow", "Gyro data is not synced with the video, open the video in Gyroflow and add sync points (eg. by doing autosync)", false);
                 } else {
                     // Constant text: Resolve sends an InstanceChanged for every status change
-                    instance_data.plugin.set_status(&mut instance_data.params, "OK", &format!("Stabilizing. Zoom is limited to {:.0}% so at least 1080p of source detail stays visible", settings.max_zoom_percent), true);
+                    instance_data.plugin.set_status(&mut instance_data.params, "OK", "Stabilizing with adaptive crop", true);
                 }
 
                 let frame_range = instance_data.source_clip.get_frame_range().ok().map(|r| (r.min, r.max));
@@ -400,6 +414,9 @@ impl Execute for GyroflowPlugin {
                     src_frame,
                     is_fusion_page: instance_data.is_fusion_page,
                 }, |ts| params.get_source_timestamp_at_ramped_timestamp(ts));
+                let visible_frames = crate::crop::visible_frames(&params, time, frame_range, src_frame, src_fps, instance_data.is_fusion_page);
+                let crop_frame = crate::crop::render_frame(&params, computed.timestamp_us);
+                let source_size = params.size;
                 drop(params);
 
                 let time = computed.fetch_time;
@@ -407,31 +424,6 @@ impl Execute for GyroflowPlugin {
 
                 // log::info!("fps: {fps:?}, src_fps: {src_fps:?}, speed_stretch: {:.6}, time: {time:?}, timestamp_us: {timestamp_us:?}, frame_range: {frame_range:?}, src_frame: {src_frame:?}, trim_offset: {:?}", computed.speed_stretch, computed.trim_offset_frames);
 
-                // Feed the timeline item's trim (queried from Resolve's scripting API) into
-                // gyroflow-core, so that adaptive zoom is solved over the visible sub-clip
-                // instead of the whole source recording — just like trimming in the Gyroflow app.
-                if duration_ms > 0.0 && fps > 0.0 {
-                    if let Some((left_frames, len_frames)) = instance_data.resolve_trim {
-                        let start_ms = (left_frames / fps * 1000.0).max(0.0);
-                        let end_ms = (((left_frames + len_frames) / fps) * 1000.0).min(duration_ms);
-                        if end_ms > start_ms {
-                            // Tolerate a few frames of rounding/jitter before re-solving the zoom
-                            let tolerance_ms = 3.0 * 1000.0 / fps;
-                            let new_range = if start_ms <= tolerance_ms && end_ms >= duration_ms - tolerance_ms {
-                                (0.0, 1.0) // Full clip -> no trim
-                            } else {
-                                (start_ms / duration_ms, end_ms / duration_ms)
-                            };
-                            let current = stab.trim_ranges().first().cloned().unwrap_or((0.0, 1.0));
-                            if ((current.0 - new_range.0) * duration_ms).abs() > tolerance_ms || ((current.1 - new_range.1) * duration_ms).abs() > tolerance_ms {
-                                log::info!("Setting trim range: {:?} ms of {duration_ms:?} ms", (new_range.0 * duration_ms, new_range.1 * duration_ms));
-                                stab.set_trim_ranges(vec![new_range]);
-                                stab.invalidate_blocking_smoothing();
-                                instance_data.log_zoom_after_render = true;
-                            }
-                        }
-                    }
-                }
                 let source_image = if in_args.get_opengl_enabled().unwrap_or_default() {
                     instance_data.source_clip.load_texture(time, None)?
                 } else {
@@ -491,6 +483,15 @@ impl Execute for GyroflowPlugin {
 
                 let input_rotation = instance_data.params.get_f64_at_time(Params::InputRotation, TimeType::Frame(time)).ok().map(|x| x as f32);
 
+                // The crop is solved for the source area this buffer really holds, at its scale
+                let crop_request = crate::crop::CropRequest {
+                    frames: visible_frames,
+                    margin: crate::crop::source_margin(stab.stabilization.read().interpolation, source_size, src_rect),
+                    response_s: settings.zoom_response_seconds,
+                    input_rotation: input_rotation.unwrap_or(0.0),
+                };
+                instance_data.crop.ensure(&stab, crop_request, crop_frame);
+
                 // log::debug!("src_size: {src_size:?} | src_rect: {src_rect:?}");
                 // log::debug!("out_size: {out_size:?} | out_rect: {out_rect:?}");
 
@@ -509,7 +510,6 @@ impl Execute for GyroflowPlugin {
                         #[cfg(any(target_os = "macos", target_os = "ios"))]
                         {
                             log::info!("metal: src_size: {src_size:?} | {src_stride}, out_size: {out_size:?} | {out_stride}");
-                            instance_data.plugin.disable_opencl();
                             let command_queue = in_args.get_metal_command_queue()? as *mut std::ffi::c_void;
 
                             Some((
@@ -523,7 +523,6 @@ impl Execute for GyroflowPlugin {
                         { None }
                         #[cfg(any(target_os = "windows", target_os = "linux"))]
                         {
-                            instance_data.plugin.disable_opencl();
                             Some((
                                 BufferSource::CUDABuffer { buffer: source_image.get_data()? as *mut std::ffi::c_void },
                                 BufferSource::CUDABuffer { buffer: output_image.get_data()? as *mut std::ffi::c_void },
@@ -580,13 +579,6 @@ impl Execute for GyroflowPlugin {
                         BitDepth::Half  => stab.process_pixels::<RGBAf16>(timestamp_us, None, &mut buffers),
                         BitDepth::Float => stab.process_pixels::<RGBAf>  (timestamp_us, None, &mut buffers)
                     };
-                    if instance_data.log_zoom_after_render {
-                        instance_data.log_zoom_after_render = false;
-                        let p = stab.params.read();
-                        let raw_min_fov = p.fovs.iter().copied().reduce(f64::min).unwrap_or(1.0);
-                        log::info!("Zoom solved: max zoom {:.1}% (limiter's measure; {:.1}% lens-adjusted), limit {:.0}%, smoothness {:.3}, horizon {:.0}%, offset {:.4?}, trim {:?}, source {:?}, output {:?}",
-                            100.0 / raw_min_fov.max(1e-6), 100.0 / p.min_fov.max(1e-6), settings.max_zoom_percent, settings.smoothness, settings.horizon_percent, p.adaptive_zoom_center_offset, p.trim_ranges, p.size, p.output_size);
-                    }
                     match processed {
                         Ok(_) => {
                             // log::info!("Rendered | {}x{} in {:.2}ms: {:?}", src_size.0, src_size.1, _time.elapsed().as_micros() as f64 / 1000.0, _);
@@ -612,19 +604,18 @@ impl Execute for GyroflowPlugin {
                 let mut instance_data = InstanceData {
                     stabilization: param_set.parameter("Stabilization")?,
                     horizon_level: param_set.parameter("HorizonLevel")?,
+                    zoom_response: param_set.parameter("ZoomResponse")?,
+                    view_mode: param_set.parameter("ViewMode")?,
                     flip_180:   param_set.parameter("Flip180")?,
                     position_x: param_set.parameter("PositionX")?,
                     position_y: param_set.parameter("PositionY")?,
-                    log_zoom_after_render: true,
+                    crop: Default::default(),
                     source_clip,
                     output_clip,
                     supports_output_size: true,
                     is_fusion_page: false,
                     file_path: None,
-                    video_path: None,
-                    resolve_trim: None,
-                    source_ranges: Arc::new(Mutex::new(None)),
-                    last_range_query: None,
+                    unsupported_reason: None,
                     params: ParamHandler {
                         instance_id:              param_set.parameter("InstanceId")?,
                         project_data:             param_set.parameter("ProjectData")?,
@@ -688,8 +679,6 @@ impl Execute for GyroflowPlugin {
                             cached_keyframes:        KeyframeManager::default()
                         })),
                     },
-                    current_file_info:         Arc::new(Mutex::new(None)),
-                    current_file_info_pending: Arc::new(AtomicBool::new(false)),
                 };
                 let mut instance_id = instance_data.params.get_string(Params::InstanceId).unwrap_or_default();
                 instance_data.plugin.initialize_instance_id(&mut instance_id);
@@ -709,9 +698,6 @@ impl Execute for GyroflowPlugin {
                 if let Ok(path) = props.get_src_file_path() {
                     if !path.is_empty() {
                         instance_data.file_path = Some(path.clone());
-                        instance_data.video_path = Some(path.clone());
-                        // Resolve recreates the instance when the clip is re-trimmed, so this picks up trim changes
-                        instance_data.query_source_ranges();
                     }
                 }
 
@@ -725,9 +711,6 @@ impl Execute for GyroflowPlugin {
                     return OK;
                 }
                 let instance_data: &mut InstanceData = effect.get_instance_data()?;
-                if in_args.get_name()? == "LoadCurrent" {
-                    CurrentFileInfo::query(instance_data.current_file_info.clone(), instance_data.current_file_info_pending.clone(), false);
-                }
                 if in_args.get_name()? == "Source" || in_args.get_name()? == "Output" || in_args.get_name()? == "ResolveUseAlphaForTrackCompositing" {
                     log::info!("InstanceChanged {:?} {:?}", in_args.get_name()?, in_args.get_change_reason()?);
                     return OK;
@@ -735,40 +718,27 @@ impl Execute for GyroflowPlugin {
 
                 if in_args.get_change_reason()? == Change::UserEdited {
                     log::info!("InstanceChanged {:?}", in_args.get_name()?);
-                    instance_data.log_zoom_after_render = true;
                 }
                 match in_args.get_name()?.as_str() {
                     "Flip180" => {
-                        // Flip drives the (hidden) video rotation, which the shared code already applies
                         let flip = instance_data.flip_180.get_value()?;
                         log::info!("Flip 180: {flip}");
-                        instance_data.params.rotation.set_value(if flip { 180.0 } else { 0.0 })?;
-                        instance_data.plugin.param_changed(&mut instance_data.params, &self.gyroflow_plugin.manager_cache, Params::Rotation, true).map_err(|e| {
-                            log::error!("param_changed error: {e:?}");
-                            Error::InvalidAction
-                        })?;
                         return OK;
                     }
                     // Applied in Render, where the stabilizer is available
-                    "Stabilization" | "HorizonLevel" | "PositionX" | "PositionY" => return OK,
-                    _ => {}
+                    "Stabilization" | "HorizonLevel" | "PositionX" | "PositionY" | "Quality" | "ZoomResponse" | "ViewMode" => return OK,
+                    _ => return OK,
                 }
+            }
 
-                if let Ok(param) = std::str::FromStr::from_str(in_args.get_name()?.as_str()) {
-                    if param == Params::OutputSizeToTimeline {
-                        let rect = instance_data.source_clip.get_region_of_definition(0.0)?;
-                        instance_data.plugin.timeline_size = ((rect.x2 - rect.x1) as usize, (rect.y2 - rect.y1) as usize);
-                    }
-
-                    instance_data.plugin.param_changed(&mut instance_data.params, &self.gyroflow_plugin.manager_cache, param, in_args.get_change_reason()? == Change::UserEdited).map_err(|e| {
-                        log::error!("param_changed error: {e:?}");
-                        Error::InvalidAction
-                    })?;
+            IsIdentity(ref mut effect, ref _in_args, ref mut out_args) => {
+                let instance_data: &InstanceData = effect.get_instance_data()?;
+                if instance_data.unsupported_reason.is_some() {
+                    out_args.set_name(&image_effect_simple_source_clip_name())?;
+                    OK
                 } else {
-                    log::error!("Unknown param name: {:?}", in_args.get_name()?);
+                    REPLY_DEFAULT
                 }
-
-                OK
             }
 
             GetRegionOfDefinition(ref mut effect, ref in_args, ref mut out_args) => {
@@ -829,9 +799,6 @@ impl Execute for GyroflowPlugin {
                         }
                         ParameterType::Button { id, label, hint } => {
                             if id == "CreateCamera" { return OK; }
-                            if id == "LoadCurrent" && !CurrentFileInfo::is_available() {
-                                return OK;
-                            }
                             let mut param = param_set.param_define_button(id)?;
                             let _ = param.set_script_name(id);
                             param.set_label(label)?;
@@ -915,7 +882,7 @@ impl Execute for GyroflowPlugin {
                     .set_children(&[
                         "ProjectGroup",
                         "AdjustGroup",
-                        "ToggleOverview"
+                        "ViewMode"
                     ])?;
 
                 OK
@@ -936,19 +903,12 @@ impl Execute for GyroflowPlugin {
                 log::info!("Host supports OpenCL: {:?}", supports_opencl);
                 log::info!("Host supports CUDA: {:?}", supports_cuda);
                 log::info!("Host supports Metal: {:?}", supports_metal);
-                if !supports_opencl && !supports_opengl {
-                    unsafe { std::env::set_var("NO_OPENCL", "1") };
-                }
-                if _plugin_context.get_host().get_name().as_deref().ok() == Some("com.vegascreativesoftware.vegas") {
-                    unsafe { std::env::set_var("NO_OPENCL", "1") };
-                }
-
                 let mut effect_properties: EffectDescriptor = effect.properties()?;
                 effect_properties.set_grouping("Warp")?;
 
                 effect_properties.set_label("Gyroflow Simple")?;
-                effect_properties.set_short_label("Gyroflow")?;
-                effect_properties.set_long_label("Gyroflow")?;
+                effect_properties.set_short_label("Gyroflow Simple")?;
+                effect_properties.set_long_label("Gyroflow Simple")?;
 
                 effect_properties.set_supported_pixel_depths(&[BitDepth::Byte, BitDepth::Short, BitDepth::Float])?;
                 effect_properties.set_supported_contexts(&[ImageEffectContext::Filter])?;
@@ -962,38 +922,6 @@ impl Execute for GyroflowPlugin {
                 effect_properties.set_render_thread_safety(ImageEffectRender::Unsafe)?;
                 effect_properties.set_supports_multi_resolution(true)?;
                 effect_properties.set_temporal_clip_access(true)?;
-
-                if supports_opengl && !supports_opencl && !supports_cuda && !supports_metal {
-                    // We'll initialize the devices in OpenGLContextAttached
-                    let _ = effect_properties.set_opengl_render_supported("true");
-                    return OK;
-                }
-
-                let opencl_devices = gyroflow_plugin_base::opencl::OclWrapper::list_devices();
-                let wgpu_devices = std::thread::spawn(gyroflow_plugin_base::wgpu::WgpuWrapper::list_devices)
-                    .join()
-                    .unwrap_or_default();
-                if !opencl_devices.is_empty() {
-                    let _ = effect_properties.set_opencl_render_supported("true");
-                    let _ = effect_properties.set_opengl_render_supported("true");
-                }
-
-                let _has_metal  = wgpu_devices.iter().any(|x| x.contains("(Metal)"));
-                let _has_vulkan = wgpu_devices.iter().any(|x| x.contains("(Vulkan)"));
-                let _has_dx12   = wgpu_devices.iter().any(|x| x.contains("(Dx12)"));
-
-                #[cfg(target_os = "macos")]
-                if !wgpu_devices.iter().any(|x| x.to_ascii_lowercase().contains("apple m")) {
-                    unsafe {
-                        std::env::set_var("NO_METAL", "1");
-                        std::env::set_var("NO_WGPU", "1");
-                    }
-                }
-
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                if _has_metal && std::env::var("NO_METAL").unwrap_or_default().is_empty() { let _ = effect_properties.set_metal_render_supported("true"); }
-                #[cfg(any(target_os = "windows", target_os = "linux"))]
-                if _has_vulkan || _has_dx12 { let _ = effect_properties.set_cuda_render_supported("true"); }
 
                 OK
             }
@@ -1011,6 +939,148 @@ impl Execute for GyroflowPlugin {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    #[ignore]
+    fn real_clip_loads_without_project_or_external_lens() {
+        let path = std::env::var("GF_TEST_VIDEO").expect("set GF_TEST_VIDEO to a MISSION 1 PRO Linear clip");
+        let stab = Arc::new(StabilizationManager::default());
+        load_standalone_video(&stab, &path).unwrap();
+        if let Some(reason) = unsupported_reason(&stab) {
+            assert!(reason.contains("4000x3000"), "unexpected pass-through reason: {reason}");
+            println!("{path}: expected pass-through: {reason}");
+            return;
+        }
+        apply_predefined_lens(&stab);
+        let mode = supported_lens(stab.camera_id.read().as_ref().unwrap()).unwrap();
+        assert_eq!(stab.lens.read().identifier, mode.identifier);
+
+        let (test_width, test_height) = if std::env::var_os("GF_TEST_FULL_RES").is_some() { (1920, 1080) } else { (320, 180) };
+        // As the OFX instances run it
+        stab.params.write().framebuffer_inverted = true;
+        stab.stabilization.write().interpolation = Interpolation::Lanczos4;
+        stab.set_output_size(test_width, test_height);
+        stab.init_size();
+        let keyframable = Arc::new(RwLock::new(KeyframableParams { use_gyroflows_keyframes: false, cached_keyframes: KeyframeManager::default() }));
+        let provider = keyframable.clone();
+        stab.keyframes.write().set_custom_provider(move |_, typ, ts| provider.read().cached_keyframes.value_at_video_timestamp(typ, ts));
+        let (fps, frame_count, source_size) = {
+            let p = stab.params.read();
+            (p.get_scaled_fps(), p.frame_count, p.size)
+        };
+        assert!(fps > 0.0 && frame_count > 1);
+
+        // Resolve's buffer: the 4:3 picture pillarboxed in opaque black, in float. The renderer's background past the
+        // source area is far out of range, so any sample of it at a visible weight shows; 8-bit output would truncate
+        stab.set_background_color(nalgebra::Vector4::new(-1000.0, -1000.0, -1000.0, -1000.0));
+        let source_rect = GyroflowPluginBase::get_center_rect_strict(test_width, test_height, 4.0 / 3.0);
+        let mut input = vec![0u8; test_width * test_height * 16];
+        for (index, pixel) in input.chunks_exact_mut(16).enumerate() {
+            let (x, y) = (index % test_width, index / test_width);
+            let inside = x >= source_rect.0 && x < source_rect.0 + source_rect.2 && y >= source_rect.1 && y < source_rect.1 + source_rect.3;
+            let value = if inside { [1.0f32; 4] } else { [0.0, 0.0, 0.0, 1.0] };
+            for (bytes, channel) in pixel.chunks_exact_mut(4).zip(value) { bytes.copy_from_slice(&channel.to_ne_bytes()); }
+        }
+        let channels = |pixel: &[u8]| pixel.chunks_exact(4).map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<_>>();
+        let mut output = vec![0u8; input.len()];
+        let every_frame = std::env::var_os("GF_TEST_ALL_FRAMES").is_some();
+        let mut crop = crate::crop::CropState::default();
+        for (stabilization, response, x, y) in [(22.5, 4.0, 0.0, 0.0), (85.0, 4.0, 0.0, 0.0), (100.0, 0.2, 0.0, 0.0), (100.0, 8.0, 100.0, 100.0), (100.0, 8.0, -100.0, -100.0)] {
+            let settings = simple::Settings::new(stabilization, 1.0, response);
+            simple::apply(&stab, &keyframable, &settings);
+            simple::apply_position(&stab, x, y);
+            let request = crate::crop::CropRequest {
+                frames: (0, frame_count - 1),
+                margin: crate::crop::source_margin(Interpolation::Lanczos4, source_size, source_rect),
+                response_s: settings.zoom_response_seconds,
+                input_rotation: 0.0,
+            };
+            let report = crop.ensure(&stab, request, 0).expect("changed settings solve the crop again");
+            let label = format!("stabilization {stabilization}, response {response}s, offset ({x}, {y})");
+            if let Some((k, slack)) = report.slack.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1)) {
+                assert!(*slack >= 0.0, "frame {} renders {:.2} px past the source edge, {label}", report.frames.0 + k, -slack);
+            }
+            assert!(report.fovs.iter().zip(&report.bounds).all(|(fov, bound)| fov.is_finite() && *fov > 0.0 && *fov <= bound + 1e-9));
+
+            // The frames closest to the edge, and an even spread
+            let mut closest: Vec<usize> = (0..report.slack.len()).collect();
+            closest.sort_by(|a, b| report.slack[*a].total_cmp(&report.slack[*b]));
+            let mut frames: Vec<usize> = if every_frame {
+                (0..frame_count).collect()
+            } else {
+                closest.into_iter().take(6).map(|k| report.frames.0 + k).chain((0..=12).map(|s| s * (frame_count - 1) / 12)).collect()
+            };
+            frames.sort_unstable();
+            frames.dedup();
+            for frame in frames {
+                let timestamp_us = (frame as f64 * 1_000_000.0 / fps).round() as i64;
+                assert_eq!(crate::crop::render_frame(&stab.params.read(), timestamp_us), frame);
+                output.fill(0);
+                let mut buffers = Buffers {
+                    input: BufferDescription { size: (test_width, test_height, test_width * 16), rect: Some(source_rect), data: BufferSource::Cpu { buffer: &mut input }, rotation: None, texture_copy: false },
+                    output: BufferDescription { size: (test_width, test_height, test_width * 16), rect: None, data: BufferSource::Cpu { buffer: &mut output }, rotation: None, texture_copy: false },
+                };
+                stab.process_pixels::<RGBAf>(timestamp_us, None, &mut buffers).unwrap();
+                let uncovered = output.chunks_exact(16).enumerate()
+                    .filter(|(_, pixel)| channels(pixel).iter().any(|c| (c - 1.0).abs() > 1e-4))
+                    .take(4).map(|(index, pixel)| (index % test_width, index / test_width, channels(pixel))).collect::<Vec<_>>();
+                assert!(uncovered.is_empty(), "uncovered {uncovered:?} at frame {frame}, {label}");
+            }
+            let tightest = report.fovs.iter().copied().fold(f64::INFINITY, f64::min);
+            let closest = report.slack.iter().copied().fold(f64::INFINITY, f64::min);
+            println!("{path}: {label}: peak zoom {:.1}%, closest sample {closest:.2} px inside the margin, {} of {} bounds lowered by the render check (up to {:.2} px), solved in {:.0} ms",
+                100.0 / tightest, report.corrected, report.fovs.len(), report.overshoot, report.elapsed_ms);
+        }
+    }
+
+    #[test]
+    fn supported_lens_requires_calibrated_telemetry_identity() {
+        let mut id = gyroflow_core::camera_identifier::CameraIdentifier {
+            brand: "GoPro".into(),
+            model: "MISSION 1 PRO".into(),
+            lens_info: "Linear".into(),
+            video_width: 4000,
+            video_height: 3000,
+            fps: 23976,
+            additional: "NO-EIS".into(),
+            ..Default::default()
+        };
+        assert!(supported_lens(&id).is_some());
+        id.lens_info = "Wide".into();
+        assert!(supported_lens(&id).is_none());
+        id.lens_info = "Linear".into();
+        id.additional = "EIS-Y".into();
+        assert!(supported_lens(&id).is_some());
+        id.additional.clear();
+        assert!(supported_lens(&id).is_some());
+        id.video_width = 3840;
+        id.video_height = 2160;
+        assert!(supported_lens(&id).is_none());
+        id.video_width = 4000;
+        id.video_height = 2250;
+        assert!(supported_lens(&id).is_none());
+        id.video_width = 3800;
+        id.video_height = 1800;
+        assert!(supported_lens(&id).is_none());
+        id.video_width = 4000;
+        id.video_height = 2160;
+        assert!(supported_lens(&id).is_none());
+        id.video_height = 3000;
+        id.fps = 50000;
+        assert!(supported_lens(&id).is_some());
+        id.model = "HERO12 Black".into();
+        assert!(supported_lens(&id).is_none());
+    }
+
+    #[test]
+    fn pass_through_preserves_pixels_across_different_strides() {
+        let source = [1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 9, 10, 11, 12, 13, 14, 15, 16, 99, 99];
+        let mut output = [0; 24];
+        assert!(copy_source_frame(&source, &mut output, (2, 2, 10), (2, 2, 12), BitDepth::Byte));
+        assert_eq!(&output[..8], &source[..8]);
+        assert_eq!(&output[12..20], &source[10..18]);
+        assert!(!copy_source_frame(&source, &mut output, (2, 2, 10), (3, 2, 12), BitDepth::Byte));
+    }
 
     #[test]
     fn layout_uses_actual_bounds_and_stride() {

@@ -6,7 +6,7 @@ dev:
     #!/bin/bash
     set -e
 
-    cargo build --release
+    cargo build --release --target-dir "{{TargetDir}}"
 
     cd "{{TargetDir}}"
     rm -rf gyroflow-ofx-simple-dev/GyroflowSimple.ofx.bundle

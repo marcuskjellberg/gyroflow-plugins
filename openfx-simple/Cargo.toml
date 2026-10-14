@@ -15,7 +15,9 @@ crate-type = ["cdylib"]
 gyroflow-plugin-base = { path = "../common", default-features = false }
 ofx = "0.3"
 log = "0.4"
-regex = "1.12"
+# The versions gyroflow-core uses: the crop solver calls into its renderer with these types
+nalgebra = "0.34"
+rayon = "1.12"
 
 [build-dependencies]
 winres = "0.1"
