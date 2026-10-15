@@ -1,8 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
-use gyroflow_plugin_base::parking_lot::Mutex;
-use gyroflow_plugin_base::rfd;
+use parking_lot::Mutex;
 
 // Resolve's scripting server is not safe against concurrent fuscript connections
 static FUSCRIPT_LOCK: Mutex<()> = Mutex::new(());
@@ -151,7 +150,7 @@ impl CurrentFileInfo {
                             width: *resolution.get(0).unwrap_or(&0),
                             height: *resolution.get(1).unwrap_or(&0),
                             pixel_aspect_ratio: par.to_string(),
-                            project_path: gyroflow_plugin_base::GyroflowPluginBase::get_project_path(&file_path),
+                            project_path: crate::GyroflowPluginBase::get_project_path(&file_path),
                             trim_frames,
                             scaling,
                         };
@@ -160,11 +159,7 @@ impl CurrentFileInfo {
                         current_file_info_pending.store(true, SeqCst);
 
                         if !silent {
-                            // Trigger render
-                            let script = "c = Resolve():GetProjectManager():GetCurrentProject():GetCurrentTimeline():GetCurrentVideoItem();
-                                              c:SetProperty('FlipX', c:GetProperty('FlipX'))";
-                            let _guard = FUSCRIPT_LOCK.lock();
-                            let _ = new_cmd().args(["-q", "-l", "lua", "-x", &script]).output();
+                            trigger_render();
                         }
                     }
                 } else {
@@ -195,6 +190,19 @@ impl CurrentFileInfo {
     }
 }
 
+/// Makes Resolve render the current timeline item again, by setting one of its properties to its own value
+pub fn trigger_render() {
+    let Some(fuscript) = CurrentFileInfo::get_fuscript() else { return };
+    let script = "c = Resolve():GetProjectManager():GetCurrentProject():GetCurrentTimeline():GetCurrentVideoItem();
+                      c:SetProperty('FlipX', c:GetProperty('FlipX'))";
+    let cmd = std::process::Command::new(&fuscript);
+    #[cfg(target_os = "windows")]
+    let cmd = { let mut cmd = cmd; use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); cmd }; // CREATE_NO_WINDOW
+    let mut cmd = cmd;
+    let _guard = FUSCRIPT_LOCK.lock();
+    let _ = cmd.args(["-q", "-l", "lua", "-x", script]).output();
+}
+
 /// Source-frame ranges `(start, end)` of every timeline item that plays a file.
 /// Unlike `CurrentFileInfo`, this doesn't depend on the playhead.
 pub struct SourceRanges;
@@ -215,7 +223,8 @@ impl SourceRanges {
         print('END');";
 
     /// Runs the query in the background and stores the ranges for `video_path` (empty if none match).
-    pub fn query(video_path: String, result: Arc<Mutex<Option<Vec<(f64, f64)>>>>) {
+    /// `rerender`: make Resolve render the current item again once the answer is in.
+    pub fn query(video_path: String, result: Arc<Mutex<Option<Vec<(f64, f64)>>>>, rerender: bool) {
         // Resolve keeps several instances per clip; they all ask at once, so share one recent answer
         static RECENT: Mutex<Option<(std::time::Instant, String)>> = Mutex::new(None);
         std::thread::spawn(move || {
@@ -242,6 +251,9 @@ impl SourceRanges {
                 let ranges = Self::parse(&stdout, &video_path);
                 log::info!("Timeline items using {video_path}: {ranges:?}");
                 *result.lock() = Some(ranges);
+                if rerender {
+                    trigger_render();
+                }
                 return;
             }
         });

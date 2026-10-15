@@ -27,7 +27,7 @@ const TOLERANCE_PX: f64 = 0.05;
 const MIN_FOV: f64 = 0.001;
 const MAX_ROUNDS: usize = 6;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CropRequest {
     /// Frames the crop has to hold for, inclusive
     pub frames: (usize, usize),
@@ -37,13 +37,25 @@ pub struct CropRequest {
     pub input_rotation: f32,
     /// One zoom for all of `frames`, the tightest bound's, instead of a curve that follows them
     pub static_crop: bool,
-    /// Extra zoom in on top of the largest crop, at least 1
-    pub zoom: f64,
+    /// Extra zoom in on top of the crop, at least 1, per frame of the clip; one value holds for every frame.
+    /// Applied after the curve, so keyframed zoom is followed as it is
+    pub zoom: Vec<f64>,
 }
 
 impl Default for CropRequest {
     fn default() -> Self {
-        Self { frames: (0, 0), margin: (0.0, 0.0), response_s: 4.0, input_rotation: 0.0, static_crop: false, zoom: 1.0 }
+        Self { frames: (0, 0), margin: (0.0, 0.0), response_s: 4.0, input_rotation: 0.0, static_crop: false, zoom: vec![1.0] }
+    }
+}
+
+impl CropRequest {
+    /// The extra zoom at a frame of the clip
+    pub fn zoom_at(&self, frame: usize) -> f64 {
+        let zoom = match self.zoom.len() {
+            0 => 1.0,
+            n => self.zoom[frame.min(n - 1)],
+        };
+        if zoom.is_finite() { zoom.max(1.0) } else { 1.0 }
     }
 }
 
@@ -122,6 +134,19 @@ pub fn visible_frames(
     (start, end.max(start))
 }
 
+/// Frames of a timeline item that plays source frames `start..end` (from Resolve's scripting API),
+/// padded by a frame for Resolve's instances disagreeing by one
+pub fn item_frames(params: &StabilizationParams, range: (f64, f64)) -> Option<(usize, usize)> {
+    let last = params.frame_count.checked_sub(1)?;
+    let (start, end) = range;
+    if !start.is_finite() || !end.is_finite() || end <= start || start > last as f64 {
+        return None;
+    }
+    // A source frame is the core's frame index, as in `visible_frames`
+    let clamp = |frame: f64| frame.clamp(0.0, last as f64) as usize;
+    Some((clamp(start.floor() - 1.0), clamp(end.ceil())))
+}
+
 /// The solved crop of one plugin instance
 #[derive(Default)]
 pub struct CropState {
@@ -131,6 +156,11 @@ pub struct CropState {
 }
 
 impl CropState {
+    /// Forgets the solve, so the next `ensure` solves again
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     /// Solves the crop again if the stabilization, the request or the manager changed, or `frame` isn't covered yet
     pub fn ensure(
         &mut self,
@@ -146,17 +176,17 @@ impl CropState {
             .solved
             .as_ref()
             .filter(|(manager, _)| std::ptr::eq(manager.as_ptr(), Arc::as_ptr(stab)))
-            .map(|(_, solved)| *solved);
+            .map(|(_, solved)| solved.clone());
         let estimate = request.frames;
         let mut frames = (estimate.0.min(frame), estimate.1.max(frame));
-        if let Some(solved) = solved {
+        if let Some(solved) = &solved {
             // A frame outside the item's estimated range widens the solved range until the item changes
             if self.estimate == Some(estimate) {
                 frames = (frames.0.min(solved.frames.0), frames.1.max(solved.frames.1));
             }
         }
         request.frames = frames;
-        if !stab.zooming_invalidated.load(SeqCst) && solved == Some(request) {
+        if !stab.zooming_invalidated.load(SeqCst) && solved.as_ref() == Some(&request) {
             return None;
         }
         let report = solve(stab, &request)?;
@@ -179,16 +209,17 @@ pub fn solve(stab: &StabilizationManager, request: &CropRequest) -> Option<CropR
     // What's checked is the normal view; the overview is a diagnostic that shows past the edge on purpose
     cp.fov_overview = false;
 
-    // A smaller rectangle inside one that fits fits too, so zooming in only scales the bounds down
-    let zoom = if request.zoom.is_finite() { request.zoom.max(1.0) } else { 1.0 };
     let mut bounds: Vec<f64> = outline_bounds(&cp, &frames, request.margin)
         .into_iter()
-        .map(|b| (b / zoom).max(MIN_FOV))
+        .map(|b| b.max(MIN_FOV))
         .collect();
     let step = std::f64::consts::LN_2 / request.response_s.max(0.01) / cp.scaled_fps;
     let half = (request.response_s / 16.0 * cp.scaled_fps).round() as usize;
+    // A smaller rectangle inside one that fits fits too, so the extra zoom only divides the curve under the bounds
+    let zoom: Vec<f64> = frames.iter().map(|f| request.zoom_at(*f)).collect();
     let curve = |bounds: &[f64]| {
-        if request.static_crop { static_curve(bounds) } else { zoom_curve(bounds, step, half) }
+        let fit = if request.static_crop { static_curve(bounds) } else { zoom_curve(bounds, step, half) };
+        fit.into_iter().zip(&zoom).map(|(f, z)| (f / z).max(MIN_FOV)).collect::<Vec<f64>>()
     };
     let mut fovs = curve(&bounds);
 
@@ -242,7 +273,7 @@ pub fn solve(stab: &StabilizationManager, request: &CropRequest) -> Option<CropR
                     -s,
                     bounds[k]
                 );
-                bounds[k] = bounds[k].min(fov).max(MIN_FOV);
+                bounds[k] = bounds[k].min(fov * zoom[k]).max(MIN_FOV);
                 corrected += 1;
                 overshoot = overshoot.max(-s);
                 lowered = true;
@@ -257,6 +288,8 @@ pub fn solve(stab: &StabilizationManager, request: &CropRequest) -> Option<CropR
         fovs = next;
     }
 
+    // The bounds as the extra zoom leaves them, so every fov stays under its bound
+    let bounds: Vec<f64> = bounds.iter().zip(&zoom).map(|(b, z)| (b / z).max(MIN_FOV)).collect();
     let lens_fov_adjustment = stab.lens.read().optimal_fov.unwrap_or(1.0);
     {
         let mut params = stab.params.write();
@@ -739,6 +772,33 @@ mod tests {
             visible_frames(&params, 10.0, Some((0.0, 100.0)), Some(420), 30.0, true),
             (0, 999)
         );
+    }
+
+    #[test]
+    fn zoom_holds_one_value_or_follows_the_frames() {
+        let mut request = CropRequest::default();
+        assert_eq!((request.zoom_at(0), request.zoom_at(500)), (1.0, 1.0));
+        request.zoom = vec![1.5];
+        assert_eq!((request.zoom_at(0), request.zoom_at(500)), (1.5, 1.5));
+        request.zoom = vec![1.0, 2.0, 0.5, f64::NAN];
+        assert_eq!((request.zoom_at(1), request.zoom_at(2), request.zoom_at(3), request.zoom_at(9)), (2.0, 1.0, 1.0, 1.0));
+        request.zoom.clear();
+        assert_eq!(request.zoom_at(3), 1.0);
+    }
+
+    #[test]
+    fn item_frames_pad_and_clamp_the_items_source_range() {
+        let mut params = StabilizationParams::default();
+        params.fps = 30.0;
+        params.frame_count = 881;
+        assert_eq!(item_frames(&params, (120.0, 600.0)), Some((119, 600)));
+        // Ends past the clip, and a cut at its start
+        assert_eq!(item_frames(&params, (0.0, 2000.0)), Some((0, 880)));
+        assert_eq!(item_frames(&params, (900.0, 1000.0)), None);
+        assert_eq!(item_frames(&params, (50.0, 50.0)), None);
+        assert_eq!(item_frames(&params, (f64::NAN, 50.0)), None);
+        params.frame_count = 0;
+        assert_eq!(item_frames(&params, (0.0, 10.0)), None);
     }
 
     #[test]

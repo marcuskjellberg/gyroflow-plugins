@@ -27,6 +27,7 @@ simplelog = "0.12.2"
 win_dbg_logger = "0.1"
 # The versions gyroflow-core uses: the crop solver calls into its renderer with these types
 nalgebra = "0.34"
+regex = "1.12"
 rayon = "1.12"
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
 

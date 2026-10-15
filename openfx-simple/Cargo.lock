@@ -1238,6 +1238,7 @@ dependencies = [
  "oslog",
  "parking_lot",
  "rayon",
+ "regex",
  "rfd",
  "serde",
  "serde_json",

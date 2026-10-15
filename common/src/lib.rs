@@ -11,6 +11,7 @@ pub use gyroflow_core;
 pub use rfd;
 pub mod cameras;
 pub mod crop;
+pub mod fuscript;
 pub mod timestamp;
 
 pub use parking_lot;

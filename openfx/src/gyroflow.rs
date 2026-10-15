@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
 use ofx::*;
-use super::fuscript::*;
+use gyroflow_plugin_base::fuscript::*;
 use gyroflow_plugin_base::*;
 use gyroflow_plugin_base::parking_lot::{ Mutex, RwLock };
 use gyroflow_plugin_base::lru::LruCache;
@@ -212,7 +212,7 @@ impl InstanceData {
         let Some(path) = self.video_path.clone() else { return };
         if self.supports_output_size || !CurrentFileInfo::is_available() { return; }
         self.last_range_query = Some(std::time::Instant::now());
-        SourceRanges::query(path, self.source_ranges.clone());
+        SourceRanges::query(path, self.source_ranges.clone(), false);
     }
 
     /// Picks the trim of the timeline item that plays `src_frame`. Several cuts of the same

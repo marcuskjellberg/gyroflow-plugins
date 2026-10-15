@@ -17,5 +17,6 @@ dev:
     codesign -f -s - --deep gyroflow-ofx-horizon-dev/HorizonLeveling.ofx.bundle
     echo ""
     echo "Dev bundle ready: {{TargetDir}}/gyroflow-ofx-horizon-dev/HorizonLeveling.ofx.bundle"
-    echo "Install with (does not touch the other Gyroflow bundles):"
-    echo "  sudo cp -R {{TargetDir}}/gyroflow-ofx-horizon-dev/HorizonLeveling.ofx.bundle /Library/OFX/Plugins/"
+    echo "Quit Resolve, then install with (does not touch the other Gyroflow bundles; removing the old bundle first"
+    echo "matters: macOS kills a process that loads a signed binary overwritten in place):"
+    echo "  sudo rm -rf /Library/OFX/Plugins/HorizonLeveling.ofx.bundle && sudo cp -R {{TargetDir}}/gyroflow-ofx-horizon-dev/HorizonLeveling.ofx.bundle /Library/OFX/Plugins/"

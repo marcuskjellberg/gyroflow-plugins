@@ -2,6 +2,7 @@ use std::sync::Arc;
 use ofx::*;
 use super::settings;
 use gyroflow_plugin_base::*;
+use gyroflow_plugin_base::fuscript::{ CurrentFileInfo, SourceRanges };
 use gyroflow_plugin_base::parking_lot::{ Mutex, RwLock };
 use gyroflow_plugin_base::lru::LruCache;
 
@@ -83,7 +84,7 @@ fn unsupported_reason(stab: &StabilizationManager) -> Option<&'static str> {
 /// Parameters shown in the panel. The shared ones keep their IDs but are hidden.
 const VISIBLE: &[&str] = &[
     "ProjectGroup", "Status",
-    "AdjustGroup", "Leveling", "StaticCrop", "CropSmoothness", "CropZoom", "OffsetX", "OffsetY",
+    "AdjustGroup", "Leveling", "StaticCrop", "CropSmoothness", "CropZoom", "OffsetX", "OffsetY", "RecalculateCrop",
     "ViewMode",
 ];
 
@@ -96,6 +97,7 @@ fn horizon_param_definitions() -> Vec<ParameterType> {
         ParameterType::Slider   { id: "CropZoom",       label: "Zoom (%)",            hint: "Zoom in further than the largest crop that fits", min: settings::DEFAULT_ZOOM_PERCENT, max: settings::MAX_ZOOM_PERCENT, default: settings::DEFAULT_ZOOM_PERCENT },
         ParameterType::Slider   { id: "OffsetX",        label: "Offset X",            hint: "Move the frame left or right, in percent of half the source width. The crop zooms in as needed", min: -settings::MAX_OFFSET_PERCENT, max: settings::MAX_OFFSET_PERCENT, default: 0.0 },
         ParameterType::Slider   { id: "OffsetY",        label: "Offset Y",            hint: "Move the frame up or down, in percent of half the source height. The crop zooms in as needed", min: -settings::MAX_OFFSET_PERCENT, max: settings::MAX_OFFSET_PERCENT, default: 0.0 },
+        ParameterType::Button   { id: "RecalculateCrop", label: "Recalculate crop",   hint: "Read the clip's in and out points from the timeline again and solve the crop for them. Happens by itself when the clip is trimmed" },
         ParameterType::Select   { id: "ViewMode",       label: "View",                hint: "Overview shows the source and the crop's boundary", options: vec!["Normal", "Overview"], default: "Normal" },
     ]
 }
@@ -199,9 +201,50 @@ struct InstanceData {
     offset_y: ParamHandle<Double>,
     view_mode: ParamHandle<Int>,
     crop: gyroflow_plugin_base::crop::CropState,
+
+    /// The source video of this instance, to find its timeline items
+    video_path: Option<String>,
+    /// Source-frame ranges of the timeline items playing `video_path`, from Resolve's scripting API
+    source_ranges: Arc<Mutex<Option<Vec<(f64, f64)>>>>,
+    /// The range of the item this instance renders, which the crop is solved over
+    item_range: Option<(f64, f64)>,
+    last_range_query: Option<std::time::Instant>,
 }
 
 impl InstanceData {
+    fn query_source_ranges(&mut self, rerender: bool) {
+        let Some(path) = self.video_path.clone() else { return };
+        if self.supports_output_size || !CurrentFileInfo::is_available() { return; }
+        self.last_range_query = Some(std::time::Instant::now());
+        SourceRanges::query(path, self.source_ranges.clone(), rerender);
+    }
+
+    /// Picks the range of the timeline item that plays `src_frame`. Several cuts of the same video
+    /// share one query result; the rendered source frame tells which cut this is.
+    fn select_item_range(&mut self, src_frame: Option<i64>) {
+        let Some(src_frame) = src_frame else { return };
+        let ranges = self.source_ranges.lock().clone();
+        let Some(ranges) = ranges else { return }; // Query pending
+        match SourceRanges::containing(&ranges, src_frame as f64) {
+            Some(range) => {
+                if self.item_range != Some(range) {
+                    log::info!("Crop range from timeline item: source frames {}..{}", range.0, range.1);
+                    self.item_range = Some(range);
+                }
+            }
+            None => {
+                // An empty list means Resolve doesn't expose this item (e.g. compound clip): don't keep asking
+                if ranges.is_empty() { return; }
+                // The timeline was edited since the query: the whole clip until the new answer
+                self.item_range = None;
+                if self.last_range_query.map_or(true, |t| t.elapsed().as_secs_f64() > 5.0) {
+                    log::info!("Source frame {src_frame} is in none of {ranges:?}, querying again");
+                    self.query_source_ranges(false);
+                }
+            }
+        }
+    }
+
     fn stab_manager(&mut self, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, output_rect: RectI) -> std::result::Result<Arc<StabilizationManager>, String> {
         /*let source_rect = self.source_clip.get_region_of_definition(0.0)?;
         let mut source_rect = RectI {
@@ -231,6 +274,15 @@ impl InstanceData {
             log::error!("plugin.stab_manager error: {e:?}");
             e.to_string()
         })
+    }
+}
+
+/// A control's value at every frame of the clip when it is keyframed, otherwise its one value at `time`
+fn sample_param(param: &ParamHandle<Double>, frame_count: usize, first_time: f64, time: f64, default: f64) -> Vec<f64> {
+    if frame_count > 1 && param.get_num_keys().unwrap_or_default() > 0 {
+        (0..frame_count).map(|frame| param.get_value_at_time(first_time + frame as f64).unwrap_or(default)).collect()
+    } else {
+        vec![param.get_value_at_time(time).or_else(|_| param.get_value()).unwrap_or(default)]
     }
 }
 
@@ -270,6 +322,7 @@ impl Execute for GyroflowPlugin {
                 let output_rect: RectI = output_image.get_region_of_definition()?;
 
                 let src_frame = in_args.get_src_frame().ok().map(|f| f as i64);
+                instance_data.select_item_range(src_frame);
                 let stab_result = instance_data.stab_manager(&self.gyroflow_plugin.manager_cache, output_rect);
                 let reason = stab_result.as_ref().err().cloned().or_else(|| stab_result.as_ref().ok().and_then(|stab| unsupported_reason(stab).map(str::to_owned)));
                 if let Some(reason) = reason {
@@ -312,13 +365,22 @@ impl Execute for GyroflowPlugin {
                     stab.set_fov_overview(overview);
                     stab.invalidate_blocking_undistortion();
                 }
+                // Keyframed controls are read at every frame of the clip. On the Edit and Color pages the host's
+                // time is the source frame, which is the core's frame index; on Fusion it counts from the clip's start
+                let frame_count = stab.params.read().frame_count;
+                let first_time = if instance_data.is_fusion_page {
+                    instance_data.source_clip.get_frame_range().map(|r| r.min).unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let sample = |param: &ParamHandle<Double>, default: f64| sample_param(param, frame_count, first_time, time, default);
                 let settings = settings::Settings::new(
-                    instance_data.leveling.get_value().unwrap_or(settings::DEFAULT_LEVELING),
+                    sample(&instance_data.leveling, settings::DEFAULT_LEVELING),
                     instance_data.static_crop.get_value().unwrap_or(false),
                     instance_data.crop_smoothness.get_value().unwrap_or(settings::DEFAULT_CROP_SMOOTHNESS_S),
-                    instance_data.zoom.get_value().unwrap_or(settings::DEFAULT_ZOOM_PERCENT),
-                    instance_data.offset_x.get_value().unwrap_or(0.0),
-                    instance_data.offset_y.get_value().unwrap_or(0.0),
+                    sample(&instance_data.zoom, settings::DEFAULT_ZOOM_PERCENT),
+                    sample(&instance_data.offset_x, 0.0),
+                    sample(&instance_data.offset_y, 0.0),
                 );
                 settings::apply(&stab, &instance_data.plugin.keyframable_params, &settings);
 
@@ -355,7 +417,11 @@ impl Execute for GyroflowPlugin {
                     instance_data.plugin.set_status(&mut instance_data.params, "Not synced. Open in Gyroflow", "Gyro data is not synced with the video, open the video in Gyroflow and add sync points (eg. by doing autosync)", false);
                 } else {
                     // Constant text: Resolve sends an InstanceChanged for every status change
-                    instance_data.plugin.set_status(&mut instance_data.params, "OK", "Leveling the horizon", true);
+                    if instance_data.item_range.is_some() {
+                        instance_data.plugin.set_status(&mut instance_data.params, "OK · in/out from timeline", "Leveling the horizon, cropped for the clip's in and out points on the timeline", true);
+                    } else {
+                        instance_data.plugin.set_status(&mut instance_data.params, "OK · whole clip", "Leveling the horizon, cropped for the whole source clip: the in and out points aren't known (they need Resolve Studio with external scripting set to Local)", true);
+                    }
                 }
 
                 let frame_range = instance_data.source_clip.get_frame_range().ok().map(|r| (r.min, r.max));
@@ -370,7 +436,9 @@ impl Execute for GyroflowPlugin {
                     src_frame,
                     is_fusion_page: instance_data.is_fusion_page,
                 }, |ts| params.get_source_timestamp_at_ramped_timestamp(ts));
-                let visible_frames = gyroflow_plugin_base::crop::visible_frames(&params, time, frame_range, src_frame, src_fps, instance_data.is_fusion_page);
+                let visible_frames = instance_data.item_range
+                    .and_then(|range| gyroflow_plugin_base::crop::item_frames(&params, range))
+                    .unwrap_or_else(|| gyroflow_plugin_base::crop::visible_frames(&params, time, frame_range, src_frame, src_fps, instance_data.is_fusion_page));
                 let crop_frame = gyroflow_plugin_base::crop::render_frame(&params, computed.timestamp_us);
                 let source_size = params.size;
                 drop(params);
@@ -446,7 +514,7 @@ impl Execute for GyroflowPlugin {
                     response_s: settings.crop_smoothness_s,
                     input_rotation: input_rotation.unwrap_or(0.0),
                     static_crop: settings.static_crop,
-                    zoom: settings.zoom,
+                    zoom: settings.zoom.clone(),
                 };
                 instance_data.crop.ensure(&stab, crop_request, crop_frame);
 
@@ -568,6 +636,10 @@ impl Execute for GyroflowPlugin {
                     offset_y:        param_set.parameter("OffsetY")?,
                     view_mode:       param_set.parameter("ViewMode")?,
                     crop: Default::default(),
+                    video_path: None,
+                    source_ranges: Default::default(),
+                    item_range: None,
+                    last_range_query: None,
                     source_clip,
                     output_clip,
                     supports_output_size: true,
@@ -656,6 +728,9 @@ impl Execute for GyroflowPlugin {
                 if let Ok(path) = props.get_src_file_path() {
                     if !path.is_empty() {
                         instance_data.file_path = Some(path.clone());
+                        instance_data.video_path = Some(path.clone());
+                        // Resolve recreates the instance when the clip is trimmed, so this picks up new in and out points
+                        instance_data.query_source_ranges(false);
                     }
                 }
 
@@ -678,6 +753,13 @@ impl Execute for GyroflowPlugin {
                     log::info!("InstanceChanged {:?}", in_args.get_name()?);
                 }
                 // Everything else is applied in Render, where the stabilizer is available
+                if in_args.get_name()? == "RecalculateCrop" {
+                    log::info!("Recalculating the crop");
+                    instance_data.crop.reset();
+                    if CurrentFileInfo::is_available() && !instance_data.supports_output_size {
+                        instance_data.query_source_ranges(true);
+                    }
+                }
                 if in_args.get_name()? == "StaticCrop" {
                     let static_crop = instance_data.static_crop.get_value()?;
                     let _ = instance_data.crop_smoothness.set_enabled(!static_crop);
@@ -753,6 +835,7 @@ impl Execute for GyroflowPlugin {
                         }
                         ParameterType::Button { id, label, hint } => {
                             if id == "CreateCamera" { return OK; }
+                            if id == "RecalculateCrop" && !CurrentFileInfo::is_available() { return OK; }
                             let mut param = param_set.param_define_button(id)?;
                             let _ = param.set_script_name(id);
                             param.set_label(label)?;
@@ -954,7 +1037,7 @@ mod layout_tests {
             (100.0, false, 4.0, 100.0, -30.0, 30.0),
         ];
         for (leveling, static_crop, smoothness, zoom, x, y) in cases {
-            let settings = settings::Settings::new(leveling, static_crop, smoothness, zoom, x, y);
+            let settings = settings::Settings::constant(leveling, static_crop, smoothness, zoom, x, y);
             settings::apply(&stab, &keyframable, &settings);
             let request = gyroflow_plugin_base::crop::CropRequest {
                 frames: (0, frame_count - 1),
@@ -962,7 +1045,7 @@ mod layout_tests {
                 response_s: settings.crop_smoothness_s,
                 input_rotation: 0.0,
                 static_crop: settings.static_crop,
-                zoom: settings.zoom,
+                zoom: settings.zoom.clone(),
             };
             let report = crop.ensure(&stab, request, 0).expect("changed settings solve the crop again");
             let label = format!("leveling {leveling}%, static {static_crop}, smoothness {smoothness}s, zoom {zoom}%, offset ({x}, {y})");
@@ -1012,8 +1095,40 @@ mod layout_tests {
                 100.0 / widest, 100.0 / tightest, report.corrected, report.fovs.len(), report.elapsed_ms);
         }
 
+        // Keyframed leveling, zoom and offset: ramps over the clip, followed frame by frame without showing past the source
+        let ramp = |from: f64, to: f64| (0..frame_count).map(|f| from + (to - from) * f as f64 / (frame_count - 1) as f64).collect::<Vec<f64>>();
+        let keyframed = settings::Settings::new(ramp(0.0, 100.0), false, 4.0, ramp(100.0, 200.0), ramp(0.0, 30.0), ramp(0.0, -30.0));
+        settings::apply(&stab, &keyframable, &keyframed);
+        let margin = gyroflow_plugin_base::crop::source_margin(Interpolation::Lanczos4, source_size, source_rect);
+        let request = gyroflow_plugin_base::crop::CropRequest { frames: (0, frame_count - 1), margin, response_s: 4.0, input_rotation: 0.0, static_crop: false, zoom: keyframed.zoom.clone() };
+        let report = crop.ensure(&stab, request, 0).expect("keyframes solve again");
+        assert!(report.slack.iter().all(|s| *s >= 0.0), "keyframed controls show past the source");
+        assert!(report.fovs.iter().zip(&report.bounds).all(|(fov, bound)| *fov <= bound + 1e-9));
+        let (start_roll, end_roll) = (correction_roll_deg(&stab, 0.0).abs(), (0..=50).map(|s| correction_roll_deg(&stab, stab.params.read().duration_ms * (0.9 + s as f64 / 500.0)).abs()).fold(0.0f64, f64::max));
+        assert!(start_roll < 1e-6, "leveling keyframed to 0% at the start rotates by {start_roll:.4} deg");
+        println!("{path}: keyframed leveling 0->100%, zoom 100->200%, offset (0,0)->(30,-30): zoom {:.1}% at the start, {:.1}% at the end, roll taken out at the end up to {end_roll:.2} deg",
+            100.0 / report.fovs[0], 100.0 / report.fovs[report.fovs.len() - 1]);
+
+        // A static crop over a trimmed part of the clip that leaves out its most tilted frame zooms in no further
+        // than over the whole clip, and still holds for every frame of that part
+        let settings = settings::Settings::constant(100.0, true, 4.0, 100.0, 0.0, 0.0);
+        settings::apply(&stab, &keyframable, &settings);
+        let request = |frames| gyroflow_plugin_base::crop::CropRequest { frames, margin, response_s: 4.0, input_rotation: 0.0, static_crop: true, zoom: vec![1.0] };
+        crop.reset();
+        let whole = crop.ensure(&stab, request((0, frame_count - 1)), 0).expect("a reset solves again");
+        let tightest = (0..whole.bounds.len()).min_by(|a, b| whole.bounds[*a].total_cmp(&whole.bounds[*b])).unwrap();
+        let gap = (2.0 * fps) as usize;
+        let part = if tightest < frame_count / 2 { ((tightest + gap).min(frame_count - 1), frame_count - 1) } else { (0, tightest.saturating_sub(gap)) };
+        let range = gyroflow_plugin_base::crop::item_frames(&stab.params.read(), (part.0 as f64 + 1.0, part.1 as f64)).unwrap();
+        let trimmed = crop.ensure(&stab, request(range), range.0).expect("other frames solve again");
+        assert_eq!(trimmed.frames, range);
+        assert!(trimmed.fovs[0] >= whole.fovs[0] - 1e-9, "trimmed zoom {} vs whole clip {}", 1.0 / trimmed.fovs[0], 1.0 / whole.fovs[0]);
+        assert!(trimmed.slack.iter().all(|s| *s >= 0.0));
+        println!("{path}: static crop over the whole clip {:.1}%, over frames {}..={} (most tilted frame {tightest} left out) {:.1}%",
+            100.0 / whole.fovs[0], range.0, range.1, 100.0 / trimmed.fovs[0]);
+
         // At 100%, the image's roll against gravity (GoPro GRAV, rotated into the image by IORI) should be what's taken out
-        settings::apply(&stab, &keyframable, &settings::Settings::new(100.0, false, 4.0, 100.0, 0.0, 0.0));
+        settings::apply(&stab, &keyframable, &settings::Settings::constant(100.0, false, 4.0, 100.0, 0.0, 0.0));
         stab.recompute_blocking();
         let gyro = stab.gyro.read();
         let gravity = gyro.file_metadata.read().gravity_vectors.clone();
