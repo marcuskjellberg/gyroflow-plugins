@@ -20,6 +20,9 @@ ofx *param:
 frei0r *param:
     just -f frei0r/Justfile {{param}}
 
+horizon *param:
+    just -f openfx-horizon/Justfile {{param}}
+
 deploy:
     just -f adobe/Justfile deploy
     just -f openfx/Justfile deploy

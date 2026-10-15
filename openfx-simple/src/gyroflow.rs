@@ -241,7 +241,7 @@ struct InstanceData {
     flip_180: ParamHandle<bool>,
     position_x: ParamHandle<Double>,
     position_y: ParamHandle<Double>,
-    crop: crate::crop::CropState,
+    crop: gyroflow_plugin_base::crop::CropState,
 }
 
 impl InstanceData {
@@ -405,7 +405,7 @@ impl Execute for GyroflowPlugin {
                 let frame_range = instance_data.source_clip.get_frame_range().ok().map(|r| (r.min, r.max));
                 let duration_ms = params.duration_ms;
 
-                let computed = crate::timestamp::compute_timestamp(&crate::timestamp::TimeParams {
+                let computed = gyroflow_plugin_base::timestamp::compute_timestamp(&gyroflow_plugin_base::timestamp::TimeParams {
                     time,
                     frame_range,
                     src_fps,
@@ -414,8 +414,8 @@ impl Execute for GyroflowPlugin {
                     src_frame,
                     is_fusion_page: instance_data.is_fusion_page,
                 }, |ts| params.get_source_timestamp_at_ramped_timestamp(ts));
-                let visible_frames = crate::crop::visible_frames(&params, time, frame_range, src_frame, src_fps, instance_data.is_fusion_page);
-                let crop_frame = crate::crop::render_frame(&params, computed.timestamp_us);
+                let visible_frames = gyroflow_plugin_base::crop::visible_frames(&params, time, frame_range, src_frame, src_fps, instance_data.is_fusion_page);
+                let crop_frame = gyroflow_plugin_base::crop::render_frame(&params, computed.timestamp_us);
                 let source_size = params.size;
                 drop(params);
 
@@ -484,11 +484,12 @@ impl Execute for GyroflowPlugin {
                 let input_rotation = instance_data.params.get_f64_at_time(Params::InputRotation, TimeType::Frame(time)).ok().map(|x| x as f32);
 
                 // The crop is solved for the source area this buffer really holds, at its scale
-                let crop_request = crate::crop::CropRequest {
+                let crop_request = gyroflow_plugin_base::crop::CropRequest {
                     frames: visible_frames,
-                    margin: crate::crop::source_margin(stab.stabilization.read().interpolation, source_size, src_rect),
+                    margin: gyroflow_plugin_base::crop::source_margin(stab.stabilization.read().interpolation, source_size, src_rect),
                     response_s: settings.zoom_response_seconds,
                     input_rotation: input_rotation.unwrap_or(0.0),
+                    ..Default::default()
                 };
                 instance_data.crop.ensure(&stab, crop_request, crop_frame);
 
@@ -984,16 +985,17 @@ mod layout_tests {
         let channels = |pixel: &[u8]| pixel.chunks_exact(4).map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<_>>();
         let mut output = vec![0u8; input.len()];
         let every_frame = std::env::var_os("GF_TEST_ALL_FRAMES").is_some();
-        let mut crop = crate::crop::CropState::default();
+        let mut crop = gyroflow_plugin_base::crop::CropState::default();
         for (stabilization, response, x, y) in [(22.5, 4.0, 0.0, 0.0), (85.0, 4.0, 0.0, 0.0), (100.0, 0.2, 0.0, 0.0), (100.0, 8.0, 100.0, 100.0), (100.0, 8.0, -100.0, -100.0)] {
             let settings = simple::Settings::new(stabilization, 1.0, response);
             simple::apply(&stab, &keyframable, &settings);
             simple::apply_position(&stab, x, y);
-            let request = crate::crop::CropRequest {
+            let request = gyroflow_plugin_base::crop::CropRequest {
                 frames: (0, frame_count - 1),
-                margin: crate::crop::source_margin(Interpolation::Lanczos4, source_size, source_rect),
+                margin: gyroflow_plugin_base::crop::source_margin(Interpolation::Lanczos4, source_size, source_rect),
                 response_s: settings.zoom_response_seconds,
                 input_rotation: 0.0,
+                ..Default::default()
             };
             let report = crop.ensure(&stab, request, 0).expect("changed settings solve the crop again");
             let label = format!("stabilization {stabilization}, response {response}s, offset ({x}, {y})");
@@ -1014,7 +1016,7 @@ mod layout_tests {
             frames.dedup();
             for frame in frames {
                 let timestamp_us = (frame as f64 * 1_000_000.0 / fps).round() as i64;
-                assert_eq!(crate::crop::render_frame(&stab.params.read(), timestamp_us), frame);
+                assert_eq!(gyroflow_plugin_base::crop::render_frame(&stab.params.read(), timestamp_us), frame);
                 output.fill(0);
                 let mut buffers = Buffers {
                     input: BufferDescription { size: (test_width, test_height, test_width * 16), rect: Some(source_rect), data: BufferSource::Cpu { buffer: &mut input }, rotation: None, texture_copy: false },

@@ -73,9 +73,56 @@ pub fn find_lens_mode(camera: &Camera, name: &str) -> Option<&'static LensMode> 
     camera.lens_modes.iter().find(|m| m.name.eq_ignore_ascii_case(name))
 }
 
+/// Identifier prefix of [`pinhole_profile_json`]'s profiles
+pub const PINHOLE_IDENTIFIER: &str = "gyroflow-plugin-pinhole";
+
+/// A lens without distortion, centred on a `width`x`height` frame and read out at once.
+///
+/// A roll about the optical axis is a rotation of the image about its centre for any radially
+/// symmetric lens, so with this profile the core's horizon lock levels footage of any lens mode
+/// without knowing its distortion.
+pub fn pinhole_profile_json(width: usize, height: usize) -> String {
+    let (w, h) = (width.max(1) as f64, height.max(1) as f64);
+    serde_json::json!({
+        "name": format!("Pinhole {width}x{height}"),
+        "camera_brand": "", "camera_model": "", "lens_model": "Pinhole",
+        "calib_dimension": { "w": width, "h": height },
+        "orig_dimension": { "w": width, "h": height },
+        "output_dimension": { "w": width, "h": height },
+        "frame_readout_time": 0.0,
+        "input_horizontal_stretch": 1.0,
+        "input_vertical_stretch": 1.0,
+        "num_images": 0,
+        "official": false,
+        "asymmetrical": false,
+        "fisheye_params": {
+            "RMS_error": 0.0,
+            "camera_matrix": [[w, 0.0, w / 2.0], [0.0, w, h / 2.0], [0.0, 0.0, 1.0]],
+            "distortion_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "radial_distortion_limit": null
+        },
+        "distortion_model": "opencv_standard",
+        "identifier": format!("{PINHOLE_IDENTIFIER}-{width}x{height}"),
+        "compatible_settings": []
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinhole_profile_loads_centred_and_without_distortion() {
+        let mut lens = gyroflow_core::lens_profile::LensProfile::default();
+        let value: serde_json::Value = serde_json::from_str(&pinhole_profile_json(4000, 3000)).unwrap();
+        lens.load_from_json_value(&value).unwrap();
+        assert_eq!(lens.identifier, "gyroflow-plugin-pinhole-4000x3000");
+        assert_eq!(lens.distortion_model.as_deref(), Some("opencv_standard"));
+        assert!(lens.fisheye_params.distortion_coeffs.iter().all(|k| *k == 0.0));
+        let m = lens.get_camera_matrix((4000, 3000));
+        assert_eq!((m[(0, 2)], m[(1, 2)]), (2000.0, 1500.0));
+    }
 
     #[test]
     fn finds_mission_1_pro_from_metadata_model() {

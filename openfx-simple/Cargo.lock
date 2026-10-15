@@ -1220,7 +1220,6 @@ dependencies = [
  "log",
  "nalgebra 0.34.2",
  "ofx",
- "rayon",
  "winres",
 ]
 
@@ -1235,8 +1234,10 @@ dependencies = [
  "log",
  "log-panics",
  "lru",
+ "nalgebra 0.34.2",
  "oslog",
  "parking_lot",
+ "rayon",
  "rfd",
  "serde",
  "serde_json",

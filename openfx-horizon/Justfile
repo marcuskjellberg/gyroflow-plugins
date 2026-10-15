@@ -1,0 +1,21 @@
+TargetDir := env_var_or_default("CARGO_TARGET_DIR", "../target")
+
+# Local development build (macOS): native arch only, ad-hoc signed
+[macos]
+dev:
+    #!/bin/bash
+    set -e
+
+    cargo build --release --target-dir "{{TargetDir}}"
+
+    cd "{{TargetDir}}"
+    rm -rf gyroflow-ofx-horizon-dev/HorizonLeveling.ofx.bundle
+    mkdir -p gyroflow-ofx-horizon-dev/HorizonLeveling.ofx.bundle/Contents/MacOS
+    cp release/libgyroflow_ofx_horizon.dylib gyroflow-ofx-horizon-dev/HorizonLeveling.ofx.bundle/Contents/MacOS/HorizonLeveling.ofx
+    cp "{{justfile_directory()}}/res/Info.plist" gyroflow-ofx-horizon-dev/HorizonLeveling.ofx.bundle/Contents/
+
+    codesign -f -s - --deep gyroflow-ofx-horizon-dev/HorizonLeveling.ofx.bundle
+    echo ""
+    echo "Dev bundle ready: {{TargetDir}}/gyroflow-ofx-horizon-dev/HorizonLeveling.ofx.bundle"
+    echo "Install with (does not touch the other Gyroflow bundles):"
+    echo "  sudo cp -R {{TargetDir}}/gyroflow-ofx-horizon-dev/HorizonLeveling.ofx.bundle /Library/OFX/Plugins/"

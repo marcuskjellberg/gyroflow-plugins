@@ -8,10 +8,8 @@
 //! map (`Stabilization::undistort_coord`); a frame that fails gets a bisected bound and the curve is
 //! solved again. A rectangle that passes holds for every smaller zoom, as the rectangles are nested.
 
-use gyroflow_plugin_base::gyroflow_core::{
-    self, stabilization_params::StabilizationParams, zooming,
-};
-use gyroflow_plugin_base::*;
+use crate::*;
+use gyroflow_core::{stabilization_params::StabilizationParams, zooming};
 use nalgebra::Vector2;
 use rayon::prelude::*;
 use std::sync::atomic::Ordering::SeqCst;
@@ -37,6 +35,16 @@ pub struct CropRequest {
     pub margin: (f64, f64),
     pub response_s: f64,
     pub input_rotation: f32,
+    /// One zoom for all of `frames`, the tightest bound's, instead of a curve that follows them
+    pub static_crop: bool,
+    /// Extra zoom in on top of the largest crop, at least 1
+    pub zoom: f64,
+}
+
+impl Default for CropRequest {
+    fn default() -> Self {
+        Self { frames: (0, 0), margin: (0.0, 0.0), response_s: 4.0, input_rotation: 0.0, static_crop: false, zoom: 1.0 }
+    }
 }
 
 // Render only needs the solve's log line; the real-clip test reads the rest
@@ -171,13 +179,18 @@ pub fn solve(stab: &StabilizationManager, request: &CropRequest) -> Option<CropR
     // What's checked is the normal view; the overview is a diagnostic that shows past the edge on purpose
     cp.fov_overview = false;
 
+    // A smaller rectangle inside one that fits fits too, so zooming in only scales the bounds down
+    let zoom = if request.zoom.is_finite() { request.zoom.max(1.0) } else { 1.0 };
     let mut bounds: Vec<f64> = outline_bounds(&cp, &frames, request.margin)
         .into_iter()
-        .map(|b| b.max(MIN_FOV))
+        .map(|b| (b / zoom).max(MIN_FOV))
         .collect();
     let step = std::f64::consts::LN_2 / request.response_s.max(0.01) / cp.scaled_fps;
     let half = (request.response_s / 16.0 * cp.scaled_fps).round() as usize;
-    let mut fovs = zoom_curve(&bounds, step, half);
+    let curve = |bounds: &[f64]| {
+        if request.static_crop { static_curve(bounds) } else { zoom_curve(bounds, step, half) }
+    };
+    let mut fovs = curve(&bounds);
 
     let samples = output_samples((cp.output_width as f64, cp.output_height as f64));
     let frame_size = rotated_size((cp.width as f64, cp.height as f64), request.input_rotation);
@@ -239,7 +252,7 @@ pub fn solve(stab: &StabilizationManager, request: &CropRequest) -> Option<CropR
             break;
         }
         // The curve only goes down, and a rectangle that passed holds when smaller: only what moved is checked again
-        let next = zoom_curve(&bounds, step, half);
+        let next = curve(&bounds);
         pending = (0..frames.len()).filter(|&k| next[k] != fovs[k]).collect();
         fovs = next;
     }
@@ -404,6 +417,12 @@ fn zoom_curve(bounds: &[f64], step: f64, half: usize) -> Vec<f64> {
         .into_iter()
         .map(f64::exp)
         .collect()
+}
+
+/// The tightest bound held for every frame
+fn static_curve(bounds: &[f64]) -> Vec<f64> {
+    let tightest = bounds.iter().copied().fold(f64::INFINITY, f64::min);
+    vec![tightest; bounds.len()]
 }
 
 /// `min_j (ln bounds[j] + step·|i - j|)`, in two passes
@@ -684,6 +703,15 @@ mod tests {
                 "half {half}"
             );
         }
+    }
+
+    #[test]
+    fn static_curve_holds_the_tightest_bound() {
+        let bounds: Vec<f64> = noise(200, 3).into_iter().map(|v| 0.3 + 0.7 * v).collect();
+        let tightest = bounds.iter().copied().fold(f64::INFINITY, f64::min);
+        let curve = static_curve(&bounds);
+        assert!(curve.iter().all(|f| *f == tightest));
+        assert!(curve.iter().zip(&bounds).all(|(f, b)| f <= b));
     }
 
     #[test]
