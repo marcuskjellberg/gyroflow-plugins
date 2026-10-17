@@ -2,7 +2,7 @@ use std::sync::Arc;
 use ofx::*;
 use super::settings;
 use gyroflow_plugin_base::*;
-use gyroflow_plugin_base::fuscript::{ CurrentFileInfo, SourceRanges };
+use gyroflow_plugin_base::fuscript::{ CurrentFileInfo, ExportStatus, SourceRanges };
 use gyroflow_plugin_base::parking_lot::{ Mutex, RwLock };
 use gyroflow_plugin_base::lru::LruCache;
 
@@ -85,7 +85,7 @@ fn unsupported_reason(stab: &StabilizationManager) -> Option<&'static str> {
 const VISIBLE: &[&str] = &[
     "ProjectGroup", "Status",
     "AdjustGroup", "Leveling", "StaticCrop", "CropSmoothness", "CropZoom", "OffsetX", "OffsetY", "RecalculateCrop",
-    "ViewMode",
+    "ViewMode", "PreviewQuality",
 ];
 
 /// Controls handled by this plugin (see `settings.rs`)
@@ -99,7 +99,31 @@ fn horizon_param_definitions() -> Vec<ParameterType> {
         ParameterType::Slider   { id: "OffsetY",        label: "Offset Y",            hint: "Move the frame up or down, in percent of half the source height. The crop zooms in as needed", min: -settings::MAX_OFFSET_PERCENT, max: settings::MAX_OFFSET_PERCENT, default: 0.0 },
         ParameterType::Button   { id: "RecalculateCrop", label: "Recalculate crop",   hint: "Read the clip's in and out points from the timeline again and solve the crop for them. Happens by itself when the clip is trimmed" },
         ParameterType::Select   { id: "ViewMode",       label: "View",                hint: "Overview shows the source and the crop's boundary", options: vec!["Normal", "Overview"], default: "Normal" },
+        ParameterType::Select   { id: "PreviewQuality", label: "Quality",             hint: "Fast plays back more smoothly, Sharp shows the full detail. On the Deliver page and for render jobs it's always Sharp (needs Resolve Studio with external scripting set to Local); Quick Export uses this setting", options: vec!["Fast", "Sharp"], default: "Fast" },
     ]
+}
+
+/// "Fast" in the Quality choice
+const PREVIEW_FAST: Int = 0;
+
+/// Whether a render is for an export: as the host's render status says, or else as Resolve's scripting API does
+/// (the Deliver page or a render job). Resolve leaves the status unset, and wraps every frame, playback too, in a
+/// sequence render it calls not interactive, so neither tells. Until scripting first answers it is taken for one
+fn is_export(interactive: Option<bool>, scripting: Option<bool>) -> bool {
+    match interactive {
+        Some(interactive) => !interactive,
+        None => scripting.unwrap_or(true),
+    }
+}
+
+/// The filter a frame is resampled with: the chosen quality's, the sharpest for an export.
+/// Lanczos4 is most of the processing time at full resolution
+fn render_interpolation(export: bool, preview_quality: Int) -> Interpolation {
+    if !export && preview_quality == PREVIEW_FAST {
+        Interpolation::Bicubic
+    } else {
+        Interpolation::Lanczos4
+    }
 }
 
 fn is_hidden_in_panel(id: &str) -> bool {
@@ -200,6 +224,9 @@ struct InstanceData {
     offset_x: ParamHandle<Double>,
     offset_y: ParamHandle<Double>,
     view_mode: ParamHandle<Int>,
+    preview_quality: ParamHandle<Int>,
+    samples: SampledControls,
+    render_stats: RenderStats,
     crop: gyroflow_plugin_base::crop::CropState,
 
     /// The source video of this instance, to find its timeline items
@@ -209,9 +236,36 @@ struct InstanceData {
     /// The range of the item this instance renders, which the crop is solved over
     item_range: Option<(f64, f64)>,
     last_range_query: Option<std::time::Instant>,
+    /// The output of the last render, so `IsIdentity` finds the same stabilizer as `Render`
+    last_output_rect: Option<RectI>,
 }
 
 impl InstanceData {
+    /// Points the hidden project path at the clip's source file, once it's known
+    fn sync_project_path(&mut self) {
+        if let Some(path) = self.file_path.take() {
+            let project_path = self.params.get_string(Params::ProjectPath).unwrap_or_default();
+            if project_path != path {
+                let _ = self.params.set_string(Params::ProjectPath, &path);
+            }
+        }
+    }
+
+    /// The stabilizer for an output of `output_rect`, noting why the clip passes through when it can't be leveled
+    fn check_supported(&mut self, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, output_rect: RectI) -> std::result::Result<Arc<StabilizationManager>, String> {
+        let stab_result = self.stab_manager(manager_cache, output_rect);
+        let reason = stab_result.as_ref().err().cloned().or_else(|| stab_result.as_ref().ok().and_then(|stab| unsupported_reason(stab).map(str::to_owned)));
+        if let Some(reason) = &reason {
+            // Checked before every frame: logged once
+            if self.unsupported_reason.as_ref() != Some(reason) {
+                log::error!("Passing the source through: {reason}");
+            }
+            self.plugin.set_status(&mut self.params, &format!("Pass-through: {reason}"), reason, false);
+        }
+        self.unsupported_reason = reason;
+        stab_result
+    }
+
     fn query_source_ranges(&mut self, rerender: bool) {
         let Some(path) = self.video_path.clone() else { return };
         if self.supports_output_size || !CurrentFileInfo::is_available() { return; }
@@ -270,20 +324,87 @@ impl InstanceData {
             format!("aspect:{}:{}", width / divisor, height / divisor)
         };
 
-        self.plugin.stab_manager_standalone(&mut self.params, manager_cache, out_size, &cache_context).map_err(|e| {
-            log::error!("plugin.stab_manager error: {e:?}");
-            e.to_string()
-        })
+        self.plugin.stab_manager_standalone(&mut self.params, manager_cache, out_size, &cache_context).map_err(|e| e.to_string())
     }
 }
 
-/// A control's value at every frame of the clip when it is keyframed, otherwise its one value at `time`
-fn sample_param(param: &ParamHandle<Double>, frame_count: usize, first_time: f64, time: f64, default: f64) -> Vec<f64> {
-    if frame_count > 1 && param.get_num_keys().unwrap_or_default() > 0 {
-        (0..frame_count).map(|frame| param.get_value_at_time(first_time + frame as f64).unwrap_or(default)).collect()
-    } else {
-        vec![param.get_value_at_time(time).or_else(|_| param.get_value()).unwrap_or(default)]
+/// A keyframed control's value at every frame of the clip, kept until its keys change: reading it
+/// at every frame costs a host call per frame of the clip
+#[derive(Default)]
+struct SampledControl {
+    /// The frames sampled (count, first host time) and the keys (time, value) the values come from
+    sampled_from: Option<(usize, f64, Vec<(f64, f64)>)>,
+    values: Vec<f64>,
+}
+
+impl SampledControl {
+    /// The control's value at every frame of the clip when it is keyframed, otherwise its one value at `time`
+    fn sample(&mut self, param: &ParamHandle<Double>, frame_count: usize, first_time: f64, time: f64, default: f64) -> Vec<f64> {
+        let num_keys = param.get_num_keys().unwrap_or_default();
+        if frame_count <= 1 || num_keys == 0 {
+            self.sampled_from = None;
+            return vec![param.get_value_at_time(time).or_else(|_| param.get_value()).unwrap_or(default)];
+        }
+        let keys: Vec<(f64, f64)> = (0..num_keys).filter_map(|i| {
+            let key_time = param.get_key_time(i).ok()?;
+            Some((key_time, param.get_value_at_time(key_time).ok()?))
+        }).collect();
+        let sampled_from = (frame_count, first_time, keys);
+        if self.sampled_from.as_ref() != Some(&sampled_from) {
+            self.values = (0..frame_count).map(|frame| param.get_value_at_time(first_time + frame as f64).unwrap_or(default)).collect();
+            self.sampled_from = Some(sampled_from);
+        }
+        self.values.clone()
     }
+}
+
+/// Renders between the render-time lines in the log
+const RENDER_LOG_INTERVAL: u32 = 120;
+
+/// Render times of one instance, logged every `RENDER_LOG_INTERVAL` frames
+#[derive(Default)]
+struct RenderStats {
+    /// The backend, buffer sizes and kind of render (playback or export) of the renders counted
+    layout: String,
+    frames: u32,
+    total_ms: f64,
+    max_ms: f64,
+    /// Of the total: waiting for the host's images, and the core's processing
+    host_ms: f64,
+    process_ms: f64,
+}
+
+impl RenderStats {
+    /// Starts counting again when the backend or the buffer sizes change. True when they did
+    fn set_layout(&mut self, layout: String) -> bool {
+        if self.layout == layout { return false; }
+        *self = Self { layout, ..Default::default() };
+        true
+    }
+
+    fn add(&mut self, elapsed: std::time::Duration, host: std::time::Duration, process: std::time::Duration) {
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        self.frames += 1;
+        self.total_ms += ms;
+        self.max_ms = self.max_ms.max(ms);
+        self.host_ms += host.as_secs_f64() * 1000.0;
+        self.process_ms += process.as_secs_f64() * 1000.0;
+        if self.frames == RENDER_LOG_INTERVAL {
+            let frames = self.frames as f64;
+            log::info!("Rendered {} frames, {}: avg {:.1} ms (host images {:.1} ms, processing {:.1} ms), max {:.1} ms",
+                self.frames, self.layout, self.total_ms / frames, self.host_ms / frames, self.process_ms / frames, self.max_ms);
+            *self = Self { layout: std::mem::take(&mut self.layout), ..Default::default() };
+        }
+    }
+}
+
+/// The keyframable controls, sampled
+#[derive(Default)]
+struct SampledControls {
+    leveling: SampledControl,
+    zoom: SampledControl,
+    offset_x: SampledControl,
+    offset_y: SampledControl,
 }
 
 fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
@@ -305,29 +426,25 @@ impl Execute for GyroflowPlugin {
                 let time = in_args.get_time()?;
                 let instance_data: &mut InstanceData = effect.get_instance_data()?;
 
-                if let Some(path) = instance_data.file_path.take() {
-                    let project_path = instance_data.params.get_string(Params::ProjectPath).unwrap_or_default();
-                    if project_path != path {
-                        let _ = instance_data.params.set_string(Params::ProjectPath, &path);
-                    }
-                }
+                instance_data.sync_project_path();
 
+                let fetch_started = std::time::Instant::now();
                 let output_image = if in_args.get_opengl_enabled().unwrap_or_default() {
                     instance_data.output_clip.load_texture_mut(time, None)?
                 } else {
                     instance_data.output_clip.get_image_mut(time)?
                 };
                 let output_image = output_image.borrow_mut();
+                let mut host_wait = fetch_started.elapsed();
 
                 let output_rect: RectI = output_image.get_region_of_definition()?;
+                instance_data.last_output_rect = Some(output_rect);
 
                 let src_frame = in_args.get_src_frame().ok().map(|f| f as i64);
                 instance_data.select_item_range(src_frame);
-                let stab_result = instance_data.stab_manager(&self.gyroflow_plugin.manager_cache, output_rect);
-                let reason = stab_result.as_ref().err().cloned().or_else(|| stab_result.as_ref().ok().and_then(|stab| unsupported_reason(stab).map(str::to_owned)));
-                if let Some(reason) = reason {
-                    instance_data.unsupported_reason = Some(reason.clone());
-                    instance_data.plugin.set_status(&mut instance_data.params, &format!("Pass-through: {reason}"), &reason, false);
+                let stab_result = instance_data.check_supported(&self.gyroflow_plugin.manager_cache, output_rect);
+                if let Some(reason) = instance_data.unsupported_reason.clone() {
+                    // Normally `IsIdentity` already had the host pass the source through; only CPU buffers can be copied here
                     let source_image = if in_args.get_opengl_enabled().unwrap_or_default() {
                         instance_data.source_clip.load_texture(time, None)?
                     } else {
@@ -357,9 +474,16 @@ impl Execute for GyroflowPlugin {
                     log::error!("Unable to pass through unsupported frame: {reason}");
                     return FAILED;
                 }
-                instance_data.unsupported_reason = None;
                 let stab = stab_result.map_err(|_| Error::UnknownError)?;
                 settings::apply_pinhole_lens(&stab);
+                let interactive = in_args.get_interactive_render_status().ok();
+                let scripting = if interactive.is_none() { ExportStatus::exporting() } else { None };
+                let export = is_export(interactive, scripting);
+                let interpolation = render_interpolation(export, instance_data.preview_quality.get_value().unwrap_or(PREVIEW_FAST));
+                if stab.stabilization.read().interpolation as i32 != interpolation as i32 {
+                    log::info!("Resampling with {interpolation:?}: export {export} (render status interactive {interactive:?}, scripting {scripting:?})");
+                    stab.stabilization.write().interpolation = interpolation;
+                }
                 let overview = instance_data.view_mode.get_value().unwrap_or(0) == 1;
                 if stab.params.read().fov_overview != overview {
                     stab.set_fov_overview(overview);
@@ -373,14 +497,14 @@ impl Execute for GyroflowPlugin {
                 } else {
                     0.0
                 };
-                let sample = |param: &ParamHandle<Double>, default: f64| sample_param(param, frame_count, first_time, time, default);
+                let samples = &mut instance_data.samples;
                 let settings = settings::Settings::new(
-                    sample(&instance_data.leveling, settings::DEFAULT_LEVELING),
+                    samples.leveling.sample(&instance_data.leveling, frame_count, first_time, time, settings::DEFAULT_LEVELING),
                     instance_data.static_crop.get_value().unwrap_or(false),
                     instance_data.crop_smoothness.get_value().unwrap_or(settings::DEFAULT_CROP_SMOOTHNESS_S),
-                    sample(&instance_data.zoom, settings::DEFAULT_ZOOM_PERCENT),
-                    sample(&instance_data.offset_x, 0.0),
-                    sample(&instance_data.offset_y, 0.0),
+                    samples.zoom.sample(&instance_data.zoom, frame_count, first_time, time, settings::DEFAULT_ZOOM_PERCENT),
+                    samples.offset_x.sample(&instance_data.offset_x, frame_count, first_time, time, 0.0),
+                    samples.offset_y.sample(&instance_data.offset_y, frame_count, first_time, time, 0.0),
                 );
                 settings::apply(&stab, &instance_data.plugin.keyframable_params, &settings);
 
@@ -448,11 +572,13 @@ impl Execute for GyroflowPlugin {
 
                 // log::info!("fps: {fps:?}, src_fps: {src_fps:?}, speed_stretch: {:.6}, time: {time:?}, timestamp_us: {timestamp_us:?}, frame_range: {frame_range:?}, src_frame: {src_frame:?}, trim_offset: {:?}", computed.speed_stretch, computed.trim_offset_frames);
 
+                let fetch_started = std::time::Instant::now();
                 let source_image = if in_args.get_opengl_enabled().unwrap_or_default() {
                     instance_data.source_clip.load_texture(time, None)?
                 } else {
                     instance_data.source_clip.get_image(time)?
                 };
+                host_wait += fetch_started.elapsed();
 
                 let source_bounds = source_image.get_bounds()?;
                 let output_bounds = output_image.get_bounds()?;
@@ -510,7 +636,9 @@ impl Execute for GyroflowPlugin {
                 // The crop is solved for the source area this buffer really holds, at its scale
                 let crop_request = gyroflow_plugin_base::crop::CropRequest {
                     frames: visible_frames,
-                    margin: gyroflow_plugin_base::crop::source_margin(stab.stabilization.read().interpolation, source_size, src_rect),
+                    // For the filter that reaches furthest, whichever renders: the viewer and the export frame the same,
+                    // and switching filters doesn't solve again
+                    margin: gyroflow_plugin_base::crop::source_margin(Interpolation::Lanczos4, source_size, src_rect),
                     response_s: settings.crop_smoothness_s,
                     input_rotation: input_rotation.unwrap_or(0.0),
                     static_crop: settings.static_crop,
@@ -520,6 +648,17 @@ impl Execute for GyroflowPlugin {
 
                 // log::debug!("src_size: {src_size:?} | src_rect: {src_rect:?}");
                 // log::debug!("out_size: {out_size:?} | out_rect: {out_rect:?}");
+
+                let backend = if in_args.get_opencl_enabled().unwrap_or_default() { "OpenCL" }
+                    else if in_args.get_metal_enabled().unwrap_or_default() { "metal" }
+                    else if in_args.get_cuda_enabled().unwrap_or_default() { "CUDA" }
+                    else if in_args.get_opengl_enabled().unwrap_or_default() { "OpenGL" }
+                    else { "CPU" };
+                // Logged when it changes, not every frame
+                let log_layout = instance_data.render_stats.set_layout(format!("{backend}: src_size: {src_size:?} | {src_stride}, out_size: {out_size:?} | {out_stride}, {interpolation:?}, export: {export}"));
+                if log_layout {
+                    log::info!("{}", instance_data.render_stats.layout);
+                }
 
                 let buffers =
                     if in_args.get_opencl_enabled().unwrap_or_default() {
@@ -535,7 +674,7 @@ impl Execute for GyroflowPlugin {
                         { None }
                         #[cfg(any(target_os = "macos", target_os = "ios"))]
                         {
-                            log::info!("metal: src_size: {src_size:?} | {src_stride}, out_size: {out_size:?} | {out_stride}");
+                            instance_data.plugin.disable_opencl();
                             let command_queue = in_args.get_metal_command_queue()? as *mut std::ffi::c_void;
 
                             Some((
@@ -549,6 +688,7 @@ impl Execute for GyroflowPlugin {
                         { None }
                         #[cfg(any(target_os = "windows", target_os = "linux"))]
                         {
+                            instance_data.plugin.disable_opencl();
                             Some((
                                 BufferSource::CUDABuffer { buffer: source_image.get_data()? as *mut std::ffi::c_void },
                                 BufferSource::CUDABuffer { buffer: output_image.get_data()? as *mut std::ffi::c_void },
@@ -556,18 +696,16 @@ impl Execute for GyroflowPlugin {
                             ))
                         }
                     } else if in_args.get_opengl_enabled().unwrap_or_default() {
-                        log::info!("OpenGL: src_size: {src_size:?} | {src_stride}, out_size: {out_size:?} | {out_stride}");
                         let texture = source_image.get_opengl_texture_index()? as u32;
                         let out_texture = output_image.get_opengl_texture_index()? as u32;
 
-                        log::info!("OpenGL in: {texture}, out: {out_texture} src_size: {src_size:?}, out_size: {out_size:?}, in_rect: {src_rect:?}, out_rect: {out_rect:?}");
+                        if log_layout { log::info!("OpenGL in: {texture}, out: {out_texture} src_size: {src_size:?}, out_size: {out_size:?}, in_rect: {src_rect:?}, out_rect: {out_rect:?}"); }
                         Some((
                             BufferSource::OpenGL { texture: texture, context: std::ptr::null_mut() },
                             BufferSource::OpenGL { texture: out_texture, context: std::ptr::null_mut() },
                             true
                         ))
                     } else {
-                        log::info!("CPU: src_size: {src_size:?} | {src_stride}, out_size: {out_size:?} | {out_stride}");
                         if src_row_bytes <= 0 || out_row_bytes <= 0 {
                             log::error!("CPU images require positive row bytes: source={src_row_bytes}, output={out_row_bytes}");
                             return FAILED;
@@ -598,6 +736,7 @@ impl Execute for GyroflowPlugin {
                         output: BufferDescription { size: out_size, rect: out_rect,       data: buffers.1, rotation: None,           texture_copy: buffers.2 }
                     };
 
+                    let process_started = std::time::Instant::now();
                     let processed = match out_depth {
                         BitDepth::None  => { return FAILED; },
                         BitDepth::Byte  => stab.process_pixels::<RGBA8>  (timestamp_us, None, &mut buffers),
@@ -607,7 +746,7 @@ impl Execute for GyroflowPlugin {
                     };
                     match processed {
                         Ok(_) => {
-                            // log::info!("Rendered | {}x{} in {:.2}ms: {:?}", src_size.0, src_size.1, _time.elapsed().as_micros() as f64 / 1000.0, _);
+                            instance_data.render_stats.add(_time.elapsed(), host_wait, process_started.elapsed());
                             OK
                         },
                         Err(e) => {
@@ -635,11 +774,15 @@ impl Execute for GyroflowPlugin {
                     offset_x:        param_set.parameter("OffsetX")?,
                     offset_y:        param_set.parameter("OffsetY")?,
                     view_mode:       param_set.parameter("ViewMode")?,
+                    preview_quality: param_set.parameter("PreviewQuality")?,
+                    samples: Default::default(),
+                    render_stats: Default::default(),
                     crop: Default::default(),
                     video_path: None,
                     source_ranges: Default::default(),
                     item_range: None,
                     last_range_query: None,
+                    last_output_rect: None,
                     source_clip,
                     output_clip,
                     supports_output_size: true,
@@ -760,6 +903,10 @@ impl Execute for GyroflowPlugin {
                         instance_data.query_source_ranges(true);
                     }
                 }
+                if matches!(in_args.get_name()?.as_str(), "Leveling" | "CropZoom" | "OffsetX" | "OffsetY") {
+                    // Also catches edits the keys' times and values don't show, like a key's interpolation
+                    instance_data.samples = Default::default();
+                }
                 if in_args.get_name()? == "StaticCrop" {
                     let static_crop = instance_data.static_crop.get_value()?;
                     let _ = instance_data.crop_smoothness.set_enabled(!static_crop);
@@ -767,8 +914,19 @@ impl Execute for GyroflowPlugin {
                 OK
             }
 
-            IsIdentity(ref mut effect, ref _in_args, ref mut out_args) => {
-                let instance_data: &InstanceData = effect.get_instance_data()?;
+            IsIdentity(ref mut effect, ref in_args, ref mut out_args) => {
+                let time = in_args.get_time()?;
+                let instance_data: &mut InstanceData = effect.get_instance_data()?;
+                // Decided before rendering: the source can only be copied through in Render when the host hands over
+                // CPU buffers. Until a render has run, the source's region stands in for the output's size
+                instance_data.sync_project_path();
+                let output_rect = instance_data.last_output_rect.or_else(|| {
+                    let rod = instance_data.source_clip.get_region_of_definition(time).ok()?;
+                    Some(RectI { x1: rod.x1 as Int, y1: rod.y1 as Int, x2: rod.x2 as Int, y2: rod.y2 as Int })
+                });
+                if let Some(output_rect) = output_rect {
+                    let _ = instance_data.check_supported(&self.gyroflow_plugin.manager_cache, output_rect);
+                }
                 if instance_data.unsupported_reason.is_some() {
                     out_args.set_name(&image_effect_simple_source_clip_name())?;
                     OK
@@ -919,7 +1077,8 @@ impl Execute for GyroflowPlugin {
                     .set_children(&[
                         "ProjectGroup",
                         "AdjustGroup",
-                        "ViewMode"
+                        "ViewMode",
+                        "PreviewQuality"
                     ])?;
 
                 OK
@@ -940,6 +1099,13 @@ impl Execute for GyroflowPlugin {
                 log::info!("Host supports OpenCL: {:?}", supports_opencl);
                 log::info!("Host supports CUDA: {:?}", supports_cuda);
                 log::info!("Host supports Metal: {:?}", supports_metal);
+                if !supports_opencl && !supports_opengl {
+                    unsafe { std::env::set_var("NO_OPENCL", "1") };
+                }
+                if _plugin_context.get_host().get_name().as_deref().ok() == Some("com.vegascreativesoftware.vegas") {
+                    unsafe { std::env::set_var("NO_OPENCL", "1") };
+                }
+
                 let mut effect_properties: EffectDescriptor = effect.properties()?;
                 effect_properties.set_grouping("Warp")?;
 
@@ -959,6 +1125,40 @@ impl Execute for GyroflowPlugin {
                 effect_properties.set_render_thread_safety(ImageEffectRender::Unsafe)?;
                 effect_properties.set_supports_multi_resolution(true)?;
                 effect_properties.set_temporal_clip_access(true)?;
+
+                // Without these the host hands over CPU buffers: on Resolve every frame then makes a round trip from
+                // its GPU to the CPU, into wgpu and back, which is most of the render time at full resolution
+                if supports_opengl && !supports_opencl && !supports_cuda && !supports_metal {
+                    // We'll initialize the devices in OpenGLContextAttached
+                    let _ = effect_properties.set_opengl_render_supported("true");
+                    return OK;
+                }
+
+                let opencl_devices = gyroflow_plugin_base::opencl::OclWrapper::list_devices();
+                let wgpu_devices = std::thread::spawn(gyroflow_plugin_base::wgpu::WgpuWrapper::list_devices)
+                    .join()
+                    .unwrap_or_default();
+                if !opencl_devices.is_empty() {
+                    let _ = effect_properties.set_opencl_render_supported("true");
+                    let _ = effect_properties.set_opengl_render_supported("true");
+                }
+
+                let _has_metal  = wgpu_devices.iter().any(|x| x.contains("(Metal)"));
+                let _has_vulkan = wgpu_devices.iter().any(|x| x.contains("(Vulkan)"));
+                let _has_dx12   = wgpu_devices.iter().any(|x| x.contains("(Dx12)"));
+
+                #[cfg(target_os = "macos")]
+                if !wgpu_devices.iter().any(|x| x.to_ascii_lowercase().contains("apple m")) {
+                    unsafe {
+                        std::env::set_var("NO_METAL", "1");
+                        std::env::set_var("NO_WGPU", "1");
+                    }
+                }
+
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                if _has_metal && std::env::var("NO_METAL").unwrap_or_default().is_empty() { let _ = effect_properties.set_metal_render_supported("true"); }
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                if _has_vulkan || _has_dx12 { let _ = effect_properties.set_cuda_render_supported("true"); }
 
                 OK
             }
@@ -1127,6 +1327,18 @@ mod layout_tests {
         println!("{path}: static crop over the whole clip {:.1}%, over frames {}..={} (most tilted frame {tightest} left out) {:.1}%",
             100.0 / whole.fovs[0], range.0, range.1, 100.0 / trimmed.fovs[0]);
 
+        // Renders at another aspect (thumbnails) use a second manager: going back and forth keeps both solves
+        let other = Arc::new(StabilizationManager::default());
+        load_standalone_video(&other, &path).unwrap();
+        other.params.write().framebuffer_inverted = true;
+        other.set_output_size(test_width, test_height);
+        other.init_size();
+        let whole_clip = request((0, frame_count - 1));
+        assert!(crop.ensure(&stab, whole_clip.clone(), 0).is_some(), "other frames solve again");
+        assert!(crop.ensure(&other, whole_clip.clone(), 0).is_some(), "a new manager solves");
+        assert!(crop.ensure(&stab, whole_clip.clone(), 0).is_none(), "the first manager's solve is kept");
+        assert!(crop.ensure(&other, whole_clip, 0).is_none(), "the second manager's solve is kept");
+
         // At 100%, the image's roll against gravity (GoPro GRAV, rotated into the image by IORI) should be what's taken out
         settings::apply(&stab, &keyframable, &settings::Settings::constant(100.0, false, 4.0, 100.0, 0.0, 0.0));
         stab.recompute_blocking();
@@ -1146,6 +1358,44 @@ mod layout_tests {
                 println!("{path}: gravity roll {:.1}..{:.1} deg; RMS difference to the correction {:.2} deg (same sign) / {:.2} deg (opposite sign)", spread.0, spread.1, rms(1.0), rms(-1.0));
             }
         }
+    }
+
+    #[test]
+    fn exports_are_always_resampled_sharp() {
+        let sharp = 1;
+        assert!(matches!(render_interpolation(false, PREVIEW_FAST), Interpolation::Bicubic));
+        assert!(matches!(render_interpolation(false, sharp), Interpolation::Lanczos4));
+        assert!(matches!(render_interpolation(true, PREVIEW_FAST), Interpolation::Lanczos4));
+        assert!(matches!(render_interpolation(true, sharp), Interpolation::Lanczos4));
+    }
+
+    #[test]
+    fn export_is_assumed_until_something_says_otherwise() {
+        // The host's render status decides when it's set
+        assert!(!is_export(Some(true), Some(true)));
+        assert!(is_export(Some(false), Some(false)));
+        // Resolve: the scripting API
+        assert!(is_export(None, Some(true)));
+        assert!(!is_export(None, Some(false)));
+        // Before its first answer: an export
+        assert!(is_export(None, None));
+    }
+
+    #[test]
+    fn render_stats_count_again_when_the_layout_changes() {
+        let mut stats = RenderStats::default();
+        assert!(stats.set_layout("metal: 4000x3000".into()));
+        assert!(!stats.set_layout("metal: 4000x3000".into()));
+        let ms = std::time::Duration::from_millis;
+        stats.add(ms(10), ms(2), ms(6));
+        stats.add(ms(30), ms(4), ms(20));
+        assert_eq!((stats.frames, stats.total_ms, stats.max_ms, stats.host_ms, stats.process_ms), (2, 40.0, 30.0, 6.0, 26.0));
+        assert!(stats.set_layout("CPU: 4000x3000".into()));
+        assert_eq!(stats.frames, 0);
+        for _ in 0..RENDER_LOG_INTERVAL {
+            stats.add(ms(5), ms(1), ms(3));
+        }
+        assert_eq!((stats.frames, stats.layout.as_str()), (0, "CPU: 4000x3000"), "logged and counting again");
     }
 
     #[test]

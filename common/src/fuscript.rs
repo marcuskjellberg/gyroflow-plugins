@@ -203,6 +203,80 @@ pub fn trigger_render() {
     let _ = cmd.args(["-q", "-l", "lua", "-x", script]).output();
 }
 
+/// Whether Resolve is exporting, from its scripting API: a render job is running, or the Deliver page is open, where
+/// the viewer shows the export. Resolve leaves the OFX render status (interactive or not) unset, so this is how a
+/// plugin can tell. It doesn't see Quick Export: that renders on the Edit page without a render job
+pub struct ExportStatus;
+
+impl ExportStatus {
+    const SCRIPT: &'static str = "local r = Resolve(); print(r:GetCurrentPage()); print(r:GetProjectManager():GetCurrentProject():IsRenderingInProgress())";
+    /// How often Resolve is asked while frames render
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+    /// After a failed answer (no Studio, external scripting off, or Resolve still starting)
+    const RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// The latest answer, asking again in the background when it's due. Resolve doesn't answer while it plays
+    /// back, and the page can't change then, so an old answer still holds. Without scripting it's never
+    /// exporting. None until the first answer
+    pub fn exporting() -> Option<bool> {
+        static ANSWER: Mutex<Option<bool>> = Mutex::new(None);
+        static NEXT_ASK: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        static ASKING: AtomicBool = AtomicBool::new(false);
+
+        if !CurrentFileInfo::is_available() {
+            return Some(false);
+        }
+        let due = NEXT_ASK.lock().map_or(true, |at| std::time::Instant::now() >= at);
+        if due && !ASKING.swap(true, SeqCst) {
+            std::thread::spawn(|| {
+                let output = CurrentFileInfo::get_fuscript().and_then(|fuscript| {
+                    let cmd = std::process::Command::new(fuscript);
+                    #[cfg(target_os = "windows")]
+                    let cmd = { let mut cmd = cmd; use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); cmd }; // CREATE_NO_WINDOW
+                    let mut cmd = cmd;
+                    let _guard = FUSCRIPT_LOCK.lock();
+                    cmd.args(["-q", "-l", "lua", "-x", Self::SCRIPT]).output().ok()
+                });
+                let stdout = output.map(|out| String::from_utf8_lossy(&out.stdout).to_string()).unwrap_or_default();
+                let now = std::time::Instant::now();
+                match Self::parse(&stdout) {
+                    Some(exporting) => {
+                        let previous = ANSWER.lock().replace(exporting);
+                        if previous != Some(exporting) {
+                            log::info!("Resolve exporting: {exporting} ({})", stdout.split_whitespace().collect::<Vec<_>>().join(", "));
+                        }
+                        *NEXT_ASK.lock() = Some(now + Self::INTERVAL);
+                    }
+                    None => {
+                        log::debug!("Export status query failed: {stdout:?}");
+                        // A failure doesn't change an answer; without any, scripting is taken to be off
+                        let mut answer = ANSWER.lock();
+                        if answer.is_none() {
+                            log::warn!("Resolve's scripting API doesn't answer: the Deliver page and render jobs can't be told apart");
+                            *answer = Some(false);
+                        }
+                        *NEXT_ASK.lock() = Some(now + Self::RETRY);
+                    }
+                }
+                ASKING.store(false, SeqCst);
+            });
+        }
+        *ANSWER.lock()
+    }
+
+    /// The page and whether a render job runs, one per line. The page can be empty, eg. while it changes
+    fn parse(stdout: &str) -> Option<bool> {
+        let mut lines = stdout.lines().map(str::trim);
+        let page = lines.next()?;
+        let rendering = match lines.next()? {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        };
+        Some(rendering || page.eq_ignore_ascii_case("deliver"))
+    }
+}
+
 /// Source-frame ranges `(start, end)` of every timeline item that plays a file.
 /// Unlike `CurrentFileInfo`, this doesn't depend on the playhead.
 pub struct SourceRanges;
@@ -314,6 +388,16 @@ mod tests {
         assert_eq!(SourceRanges::containing(&split, 100.0), Some((100.0, 150.0)));
         assert_eq!(SourceRanges::containing(&split, 151.0), Some((100.0, 150.0)));
     }
+    #[test]
+    fn exports_on_the_deliver_page_or_while_rendering() {
+        assert_eq!(ExportStatus::parse("edit\nfalse\n"), Some(false));
+        assert_eq!(ExportStatus::parse("color\ntrue\n"), Some(true));
+        assert_eq!(ExportStatus::parse("deliver\nfalse\n"), Some(true));
+        assert_eq!(ExportStatus::parse("\nfalse\n"), Some(false));
+        assert_eq!(ExportStatus::parse(""), None);
+        assert_eq!(ExportStatus::parse("edit\nnil\n"), None);
+    }
+
     #[test]
     fn resolves_explicit_and_inherited_fit() {
         assert_eq!(ResolveScaling::from_values(Some(2), Some("scaleToFill")), ResolveScaling::Fit);
