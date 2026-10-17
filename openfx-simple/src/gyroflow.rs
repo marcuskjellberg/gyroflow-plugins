@@ -241,10 +241,39 @@ struct InstanceData {
     flip_180: ParamHandle<bool>,
     position_x: ParamHandle<Double>,
     position_y: ParamHandle<Double>,
+    render_stats: RenderStats,
     crop: gyroflow_plugin_base::crop::CropState,
+
+    /// The output of the last render, so `IsIdentity` finds the same stabilizer as `Render`
+    last_output_rect: Option<RectI>,
 }
 
 impl InstanceData {
+    /// Points the hidden project path at the clip's source file, once it's known
+    fn sync_project_path(&mut self) {
+        if let Some(path) = self.file_path.take() {
+            let project_path = self.params.get_string(Params::ProjectPath).unwrap_or_default();
+            if project_path != path {
+                let _ = self.params.set_string(Params::ProjectPath, &path);
+            }
+        }
+    }
+
+    /// The stabilizer for an output of `output_rect`, noting why the clip passes through when it can't be stabilized
+    fn check_supported(&mut self, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, output_rect: RectI) -> std::result::Result<Arc<StabilizationManager>, String> {
+        let stab_result = self.stab_manager(manager_cache, output_rect);
+        let reason = stab_result.as_ref().err().cloned().or_else(|| stab_result.as_ref().ok().and_then(|stab| unsupported_reason(stab).map(str::to_owned)));
+        if let Some(reason) = &reason {
+            // Checked before every frame: logged once
+            if self.unsupported_reason.as_ref() != Some(reason) {
+                log::error!("Passing the source through: {reason}");
+            }
+            self.plugin.set_status(&mut self.params, &format!("Pass-through: {reason}"), reason, false);
+        }
+        self.unsupported_reason = reason;
+        stab_result
+    }
+
     fn stab_manager(&mut self, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, output_rect: RectI) -> std::result::Result<Arc<StabilizationManager>, String> {
         /*let source_rect = self.source_clip.get_region_of_definition(0.0)?;
         let mut source_rect = RectI {
@@ -270,10 +299,40 @@ impl InstanceData {
             format!("aspect:{}:{}", width / divisor, height / divisor)
         };
 
-        self.plugin.stab_manager_standalone(&mut self.params, manager_cache, out_size, &cache_context).map_err(|e| {
-            log::error!("plugin.stab_manager error: {e:?}");
-            e.to_string()
-        })
+        self.plugin.stab_manager_standalone(&mut self.params, manager_cache, out_size, &cache_context).map_err(|e| e.to_string())
+    }
+}
+
+/// Renders between the render-time lines in the log
+const RENDER_LOG_INTERVAL: u32 = 120;
+
+/// Render times of one instance, logged every `RENDER_LOG_INTERVAL` frames
+#[derive(Default)]
+struct RenderStats {
+    /// The backend and buffer sizes of the renders counted
+    layout: String,
+    frames: u32,
+    total_ms: f64,
+    max_ms: f64,
+}
+
+impl RenderStats {
+    /// Starts counting again when the backend or the buffer sizes change. True when they did
+    fn set_layout(&mut self, layout: String) -> bool {
+        if self.layout == layout { return false; }
+        *self = Self { layout, ..Default::default() };
+        true
+    }
+
+    fn add(&mut self, elapsed: std::time::Duration) {
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        self.frames += 1;
+        self.total_ms += ms;
+        self.max_ms = self.max_ms.max(ms);
+        if self.frames == RENDER_LOG_INTERVAL {
+            log::info!("Rendered {} frames, {}: avg {:.1} ms, max {:.1} ms", self.frames, self.layout, self.total_ms / self.frames as f64, self.max_ms);
+            *self = Self { layout: std::mem::take(&mut self.layout), ..Default::default() };
+        }
     }
 }
 
@@ -296,12 +355,7 @@ impl Execute for GyroflowPlugin {
                 let time = in_args.get_time()?;
                 let instance_data: &mut InstanceData = effect.get_instance_data()?;
 
-                if let Some(path) = instance_data.file_path.take() {
-                    let project_path = instance_data.params.get_string(Params::ProjectPath).unwrap_or_default();
-                    if project_path != path {
-                        let _ = instance_data.params.set_string(Params::ProjectPath, &path);
-                    }
-                }
+                instance_data.sync_project_path();
 
                 let output_image = if in_args.get_opengl_enabled().unwrap_or_default() {
                     instance_data.output_clip.load_texture_mut(time, None)?
@@ -311,13 +365,12 @@ impl Execute for GyroflowPlugin {
                 let output_image = output_image.borrow_mut();
 
                 let output_rect: RectI = output_image.get_region_of_definition()?;
+                instance_data.last_output_rect = Some(output_rect);
 
                 let src_frame = in_args.get_src_frame().ok().map(|f| f as i64);
-                let stab_result = instance_data.stab_manager(&self.gyroflow_plugin.manager_cache, output_rect);
-                let reason = stab_result.as_ref().err().cloned().or_else(|| stab_result.as_ref().ok().and_then(|stab| unsupported_reason(stab).map(str::to_owned)));
-                if let Some(reason) = reason {
-                    instance_data.unsupported_reason = Some(reason.clone());
-                    instance_data.plugin.set_status(&mut instance_data.params, &format!("Pass-through: {reason}"), &reason, false);
+                let stab_result = instance_data.check_supported(&self.gyroflow_plugin.manager_cache, output_rect);
+                if let Some(reason) = instance_data.unsupported_reason.clone() {
+                    // Normally `IsIdentity` already had the host pass the source through; only CPU buffers can be copied here
                     let source_image = if in_args.get_opengl_enabled().unwrap_or_default() {
                         instance_data.source_clip.load_texture(time, None)?
                     } else {
@@ -347,8 +400,7 @@ impl Execute for GyroflowPlugin {
                     log::error!("Unable to pass through unsupported frame: {reason}");
                     return FAILED;
                 }
-                instance_data.unsupported_reason = None;
-                let stab = stab_result.map_err(|_| Error::UnknownError)?;
+                let stab =stab_result.map_err(|_| Error::UnknownError)?;
                 apply_predefined_lens(&stab);
                 apply_orientation(&stab, &instance_data.plugin.keyframable_params, instance_data.flip_180.get_value().unwrap_or(false));
                 let overview = instance_data.view_mode.get_value().unwrap_or(0) == 1;
@@ -496,6 +548,17 @@ impl Execute for GyroflowPlugin {
                 // log::debug!("src_size: {src_size:?} | src_rect: {src_rect:?}");
                 // log::debug!("out_size: {out_size:?} | out_rect: {out_rect:?}");
 
+                let backend = if in_args.get_opencl_enabled().unwrap_or_default() { "OpenCL" }
+                    else if in_args.get_metal_enabled().unwrap_or_default() { "metal" }
+                    else if in_args.get_cuda_enabled().unwrap_or_default() { "CUDA" }
+                    else if in_args.get_opengl_enabled().unwrap_or_default() { "OpenGL" }
+                    else { "CPU" };
+                // Logged when it changes, not every frame
+                let log_layout = instance_data.render_stats.set_layout(format!("{backend}: src_size: {src_size:?} | {src_stride}, out_size: {out_size:?} | {out_stride}"));
+                if log_layout {
+                    log::info!("{}", instance_data.render_stats.layout);
+                }
+
                 let buffers =
                     if in_args.get_opencl_enabled().unwrap_or_default() {
                         use std::ffi::c_void;
@@ -510,7 +573,7 @@ impl Execute for GyroflowPlugin {
                         { None }
                         #[cfg(any(target_os = "macos", target_os = "ios"))]
                         {
-                            log::info!("metal: src_size: {src_size:?} | {src_stride}, out_size: {out_size:?} | {out_stride}");
+                            instance_data.plugin.disable_opencl();
                             let command_queue = in_args.get_metal_command_queue()? as *mut std::ffi::c_void;
 
                             Some((
@@ -524,6 +587,7 @@ impl Execute for GyroflowPlugin {
                         { None }
                         #[cfg(any(target_os = "windows", target_os = "linux"))]
                         {
+                            instance_data.plugin.disable_opencl();
                             Some((
                                 BufferSource::CUDABuffer { buffer: source_image.get_data()? as *mut std::ffi::c_void },
                                 BufferSource::CUDABuffer { buffer: output_image.get_data()? as *mut std::ffi::c_void },
@@ -531,18 +595,16 @@ impl Execute for GyroflowPlugin {
                             ))
                         }
                     } else if in_args.get_opengl_enabled().unwrap_or_default() {
-                        log::info!("OpenGL: src_size: {src_size:?} | {src_stride}, out_size: {out_size:?} | {out_stride}");
                         let texture = source_image.get_opengl_texture_index()? as u32;
                         let out_texture = output_image.get_opengl_texture_index()? as u32;
 
-                        log::info!("OpenGL in: {texture}, out: {out_texture} src_size: {src_size:?}, out_size: {out_size:?}, in_rect: {src_rect:?}, out_rect: {out_rect:?}");
+                        if log_layout { log::info!("OpenGL in: {texture}, out: {out_texture} src_size: {src_size:?}, out_size: {out_size:?}, in_rect: {src_rect:?}, out_rect: {out_rect:?}"); }
                         Some((
                             BufferSource::OpenGL { texture: texture, context: std::ptr::null_mut() },
                             BufferSource::OpenGL { texture: out_texture, context: std::ptr::null_mut() },
                             true
                         ))
                     } else {
-                        log::info!("CPU: src_size: {src_size:?} | {src_stride}, out_size: {out_size:?} | {out_stride}");
                         if src_row_bytes <= 0 || out_row_bytes <= 0 {
                             log::error!("CPU images require positive row bytes: source={src_row_bytes}, output={out_row_bytes}");
                             return FAILED;
@@ -582,7 +644,7 @@ impl Execute for GyroflowPlugin {
                     };
                     match processed {
                         Ok(_) => {
-                            // log::info!("Rendered | {}x{} in {:.2}ms: {:?}", src_size.0, src_size.1, _time.elapsed().as_micros() as f64 / 1000.0, _);
+                            instance_data.render_stats.add(_time.elapsed());
                             OK
                         },
                         Err(e) => {
@@ -610,7 +672,9 @@ impl Execute for GyroflowPlugin {
                     flip_180:   param_set.parameter("Flip180")?,
                     position_x: param_set.parameter("PositionX")?,
                     position_y: param_set.parameter("PositionY")?,
+                    render_stats: Default::default(),
                     crop: Default::default(),
+                    last_output_rect: None,
                     source_clip,
                     output_clip,
                     supports_output_size: true,
@@ -732,8 +796,19 @@ impl Execute for GyroflowPlugin {
                 }
             }
 
-            IsIdentity(ref mut effect, ref _in_args, ref mut out_args) => {
-                let instance_data: &InstanceData = effect.get_instance_data()?;
+            IsIdentity(ref mut effect, ref in_args, ref mut out_args) => {
+                let time = in_args.get_time()?;
+                let instance_data: &mut InstanceData = effect.get_instance_data()?;
+                // Decided before rendering: the source can only be copied through in Render when the host hands over
+                // CPU buffers. Until a render has run, the source's region stands in for the output's size
+                instance_data.sync_project_path();
+                let output_rect = instance_data.last_output_rect.or_else(|| {
+                    let rod = instance_data.source_clip.get_region_of_definition(time).ok()?;
+                    Some(RectI { x1: rod.x1 as Int, y1: rod.y1 as Int, x2: rod.x2 as Int, y2: rod.y2 as Int })
+                });
+                if let Some(output_rect) = output_rect {
+                    let _ = instance_data.check_supported(&self.gyroflow_plugin.manager_cache, output_rect);
+                }
                 if instance_data.unsupported_reason.is_some() {
                     out_args.set_name(&image_effect_simple_source_clip_name())?;
                     OK
@@ -904,6 +979,13 @@ impl Execute for GyroflowPlugin {
                 log::info!("Host supports OpenCL: {:?}", supports_opencl);
                 log::info!("Host supports CUDA: {:?}", supports_cuda);
                 log::info!("Host supports Metal: {:?}", supports_metal);
+                if !supports_opencl && !supports_opengl {
+                    unsafe { std::env::set_var("NO_OPENCL", "1") };
+                }
+                if _plugin_context.get_host().get_name().as_deref().ok() == Some("com.vegascreativesoftware.vegas") {
+                    unsafe { std::env::set_var("NO_OPENCL", "1") };
+                }
+
                 let mut effect_properties: EffectDescriptor = effect.properties()?;
                 effect_properties.set_grouping("Warp")?;
 
@@ -923,6 +1005,40 @@ impl Execute for GyroflowPlugin {
                 effect_properties.set_render_thread_safety(ImageEffectRender::Unsafe)?;
                 effect_properties.set_supports_multi_resolution(true)?;
                 effect_properties.set_temporal_clip_access(true)?;
+
+                // Without these the host hands over CPU buffers: on Resolve every frame then makes a round trip from
+                // its GPU to the CPU, into wgpu and back, which is most of the render time at full resolution
+                if supports_opengl && !supports_opencl && !supports_cuda && !supports_metal {
+                    // We'll initialize the devices in OpenGLContextAttached
+                    let _ = effect_properties.set_opengl_render_supported("true");
+                    return OK;
+                }
+
+                let opencl_devices = gyroflow_plugin_base::opencl::OclWrapper::list_devices();
+                let wgpu_devices = std::thread::spawn(gyroflow_plugin_base::wgpu::WgpuWrapper::list_devices)
+                    .join()
+                    .unwrap_or_default();
+                if !opencl_devices.is_empty() {
+                    let _ = effect_properties.set_opencl_render_supported("true");
+                    let _ = effect_properties.set_opengl_render_supported("true");
+                }
+
+                let _has_metal  = wgpu_devices.iter().any(|x| x.contains("(Metal)"));
+                let _has_vulkan = wgpu_devices.iter().any(|x| x.contains("(Vulkan)"));
+                let _has_dx12   = wgpu_devices.iter().any(|x| x.contains("(Dx12)"));
+
+                #[cfg(target_os = "macos")]
+                if !wgpu_devices.iter().any(|x| x.to_ascii_lowercase().contains("apple m")) {
+                    unsafe {
+                        std::env::set_var("NO_METAL", "1");
+                        std::env::set_var("NO_WGPU", "1");
+                    }
+                }
+
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                if _has_metal && std::env::var("NO_METAL").unwrap_or_default().is_empty() { let _ = effect_properties.set_metal_render_supported("true"); }
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                if _has_vulkan || _has_dx12 { let _ = effect_properties.set_cuda_render_supported("true"); }
 
                 OK
             }
@@ -1072,6 +1188,22 @@ mod layout_tests {
         assert!(supported_lens(&id).is_some());
         id.model = "HERO12 Black".into();
         assert!(supported_lens(&id).is_none());
+    }
+
+    #[test]
+    fn render_stats_count_again_when_the_layout_changes() {
+        let mut stats = RenderStats::default();
+        assert!(stats.set_layout("metal: 4000x3000".into()));
+        assert!(!stats.set_layout("metal: 4000x3000".into()));
+        stats.add(std::time::Duration::from_millis(10));
+        stats.add(std::time::Duration::from_millis(30));
+        assert_eq!((stats.frames, stats.total_ms, stats.max_ms), (2, 40.0, 30.0));
+        assert!(stats.set_layout("CPU: 4000x3000".into()));
+        assert_eq!(stats.frames, 0);
+        for _ in 0..RENDER_LOG_INTERVAL {
+            stats.add(std::time::Duration::from_millis(5));
+        }
+        assert_eq!((stats.frames, stats.layout.as_str()), (0, "CPU: 4000x3000"), "logged and counting again");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 - Resolve Studio on macOS, initially GoPro MISSION 1 PRO Linear with a 4000x3000 (4:3) source at any frame rate and EIS setting. The bundled calibration in `common/res/lens_profiles/` was measured at 23.98 fps without EIS; EIS-on footage is accepted but its geometric accuracy has not been validated. Wide and 16:9 source modes have no bundled calibration and pass through.
 - Bundle: `GyroflowSimple.ofx.bundle`; identifier: `xyz.gyroflow.simple.ofx`. The existing `openfx/` plugin keeps its own project workflow.
 - Simple loads source-video metadata and embedded gyro directly through the pinned Gyroflow core. It does not run fuscript, launch the Gyroflow app, import `.gyroflow` projects or presets, or consult the installed lens-profile database. Its cache entries are separate from the legacy plugin's.
-- Unsupported or unsynchronized clips show a pass-through reason. CPU renders copy the source; after an unsupported render, `IsIdentity` requests host pass-through. Check this behavior in Resolve before release.
+- Unsupported or unsynchronized clips show a pass-through reason. `IsIdentity` decides pass-through before rendering (sized by the last render's output, or the source clip's RoD before the first), because Simple declares Metal, OpenCL and CUDA rendering and GPU buffers can't be copied in Render. Render only copies the source when the host hands over CPU buffers. Check this behavior in Resolve before release.
 
 ## Panel
 
