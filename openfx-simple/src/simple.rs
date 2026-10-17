@@ -64,7 +64,8 @@ pub fn apply(stab: &StabilizationManager, keyframable: &RwLock<KeyframableParams
         let p = stab.params.read();
         (p.max_zoom, p.max_zoom_iterations, p.adaptive_zoom_window, p.adaptive_zoom_method)
     };
-    if max_zoom.map_or(true, |z| z.abs() > 1e-6) || iterations != MAX_ZOOM_ITERATIONS {
+    // `set_max_zoom(0.0)` turns the limit off, which reads back as None
+    if max_zoom.is_some() || iterations != MAX_ZOOM_ITERATIONS {
         stab.set_max_zoom(0.0, MAX_ZOOM_ITERATIONS);
         changed = true;
     }
@@ -122,6 +123,17 @@ mod tests {
         let nan = Settings::new(f64::NAN, f64::NAN, f64::NAN);
         assert_eq!((nan.smoothness, nan.horizon_percent), (0.85, 90.0));
         assert_eq!(nan.zoom_response_seconds, DEFAULT_ZOOM_RESPONSE_S);
+    }
+
+    #[test]
+    fn unchanged_settings_are_not_applied_again() {
+        let stab = StabilizationManager::default();
+        let keyframable = RwLock::new(KeyframableParams { use_gyroflows_keyframes: false, cached_keyframes: KeyframeManager::default() });
+        let s = Settings::new(85.0, 0.9, 4.0);
+        assert!(apply(&stab, &keyframable, &s));
+        // Applying again recomputes the stabilization and solves the crop at every rendered frame
+        assert!(!apply(&stab, &keyframable, &s));
+        assert!(apply(&stab, &keyframable, &Settings::new(50.0, 0.9, 4.0)));
     }
 
 }
