@@ -26,6 +26,9 @@ const TOLERANCE_PX: f64 = 0.05;
 /// The renderer's smallest fov (`FrameTransform::get_fov`)
 const MIN_FOV: f64 = 0.001;
 const MAX_ROUNDS: usize = 6;
+/// Managers whose solve an instance keeps: a render at another aspect (a thumbnail) uses another manager,
+/// which keeps its own fovs, so going back and forth doesn't solve again
+const KEPT_SOLVES: usize = 4;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CropRequest {
@@ -147,12 +150,18 @@ pub fn item_frames(params: &StabilizationParams, range: (f64, f64)) -> Option<(u
     Some((clamp(start.floor() - 1.0), clamp(end.ceil())))
 }
 
-/// The solved crop of one plugin instance
+/// The solved crops of one plugin instance, one per manager it renders with, latest first
 #[derive(Default)]
 pub struct CropState {
+    solved: Vec<Solved>,
+}
+
+struct Solved {
     /// Held weakly, so no other manager can take its address while it's compared against
-    solved: Option<(Weak<StabilizationManager>, CropRequest)>,
-    estimate: Option<(usize, usize)>,
+    manager: Weak<StabilizationManager>,
+    request: CropRequest,
+    /// The frames asked for, before frames outside them widened `request`
+    estimate: (usize, usize),
 }
 
 impl CropState {
@@ -161,7 +170,8 @@ impl CropState {
         *self = Self::default();
     }
 
-    /// Solves the crop again if the stabilization, the request or the manager changed, or `frame` isn't covered yet
+    /// Solves the crop again if the stabilization or the request changed, the manager hasn't been solved for, or
+    /// `frame` isn't covered yet
     pub fn ensure(
         &mut self,
         stab: &Arc<StabilizationManager>,
@@ -172,26 +182,43 @@ impl CropState {
             stab.recompute_smoothness();
             stab.smoothing_invalidated.store(false, SeqCst);
         }
-        let solved = self
+        // A manager that's gone can't be rendered with again, and its address may be reused
+        self.solved
+            .retain(|solved| solved.manager.strong_count() > 0);
+        let index = self
             .solved
-            .as_ref()
-            .filter(|(manager, _)| std::ptr::eq(manager.as_ptr(), Arc::as_ptr(stab)))
-            .map(|(_, solved)| solved.clone());
+            .iter()
+            .position(|solved| std::ptr::eq(solved.manager.as_ptr(), Arc::as_ptr(stab)));
         let estimate = request.frames;
         let mut frames = (estimate.0.min(frame), estimate.1.max(frame));
-        if let Some(solved) = &solved {
+        if let Some(solved) = index.map(|i| &self.solved[i]) {
             // A frame outside the item's estimated range widens the solved range until the item changes
-            if self.estimate == Some(estimate) {
-                frames = (frames.0.min(solved.frames.0), frames.1.max(solved.frames.1));
+            if solved.estimate == estimate {
+                frames = (
+                    frames.0.min(solved.request.frames.0),
+                    frames.1.max(solved.request.frames.1),
+                );
             }
         }
         request.frames = frames;
-        if !stab.zooming_invalidated.load(SeqCst) && solved.as_ref() == Some(&request) {
+        if !stab.zooming_invalidated.load(SeqCst)
+            && index.is_some_and(|i| self.solved[i].request == request)
+        {
             return None;
         }
         let report = solve(stab, &request)?;
-        self.solved = Some((Arc::downgrade(stab), request));
-        self.estimate = Some(estimate);
+        if let Some(i) = index {
+            self.solved.remove(i);
+        }
+        self.solved.insert(
+            0,
+            Solved {
+                manager: Arc::downgrade(stab),
+                request,
+                estimate,
+            },
+        );
+        self.solved.truncate(KEPT_SOLVES);
         Some(report)
     }
 }
