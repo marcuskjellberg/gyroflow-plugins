@@ -86,6 +86,8 @@ pub fn pinhole_profile_json(width: usize, height: usize) -> String {
     serde_json::json!({
         "name": format!("Pinhole {width}x{height}"),
         "camera_brand": "", "camera_model": "", "lens_model": "Pinhole",
+        // Without one the core loads the profile but reports it as invalid
+        "calibrator_version": "gyroflow-plugin",
         "calib_dimension": { "w": width, "h": height },
         "orig_dimension": { "w": width, "h": height },
         "output_dimension": { "w": width, "h": height },
@@ -122,6 +124,11 @@ mod tests {
         assert!(lens.fisheye_params.distortion_coeffs.iter().all(|k| *k == 0.0));
         let m = lens.get_camera_matrix((4000, 3000));
         assert_eq!((m[(0, 2)], m[(1, 2)]), (2000.0, 1500.0));
+
+        // The way the plugin loads it
+        let stab = gyroflow_core::StabilizationManager::default();
+        stab.load_lens_profile(&pinhole_profile_json(4000, 3000)).expect("the pinhole profile loads without an error");
+        assert_eq!(stab.lens.read().identifier, "gyroflow-plugin-pinhole-4000x3000");
     }
 
     #[test]

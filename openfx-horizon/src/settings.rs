@@ -57,10 +57,9 @@ impl Settings {
 /// Loads the distortion-free lens for the clip's size, unless it already is the loaded one
 pub fn apply_pinhole_lens(stab: &StabilizationManager) {
     let (width, height) = stab.params.read().size;
-    let json = cameras::pinhole_profile_json(width, height);
     let identifier = format!("{}-{width}x{height}", cameras::PINHOLE_IDENTIFIER);
     if stab.lens.read().identifier == identifier { return; }
-    match stab.load_lens_profile(&json) {
+    match stab.load_lens_profile(&cameras::pinhole_profile_json(width, height)) {
         Ok(_) => {
             log::info!("Applied pinhole lens {width}x{height}");
             stab.invalidate_blocking_smoothing();
