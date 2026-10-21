@@ -6,6 +6,7 @@
 //!
 //! Leveling, zoom and offset can be keyframed: each is one value, or a value per frame of the clip.
 
+use std::sync::Arc;
 use gyroflow_plugin_base::*;
 use gyroflow_plugin_base::parking_lot::RwLock;
 
@@ -91,9 +92,13 @@ fn set_keyframes(manager: &mut KeyframeManager, typ: &KeyframeType, wanted: &[(i
     true
 }
 
+/// The leveling and the offset a manager's stabilization was last computed with, by whichever instance
+static APPLIED_LEVELING: ManagerRecords<Vec<f64>> = ManagerRecords::new();
+static APPLIED_OFFSET: ManagerRecords<(Vec<f64>, Vec<f64>)> = ManagerRecords::new();
+
 /// Writes the settings into the plugin's keyframe cache (which the core reads through the keyframe
 /// provider) and the core's parameters. Returns true when something changed.
-pub fn apply(stab: &StabilizationManager, keyframable: &RwLock<KeyframableParams>, s: &Settings) -> bool {
+pub fn apply(stab: &Arc<StabilizationManager>, keyframable: &RwLock<KeyframableParams>, s: &Settings) -> bool {
     let fps = stab.params.read().get_scaled_fps();
     if !(fps > 0.0) { return false; }
     let (smoothing_changed, offset_changed) = {
@@ -107,6 +112,10 @@ pub fn apply(stab: &StabilizationManager, keyframable: &RwLock<KeyframableParams
         offset |= set_keyframes(kf, &KeyframeType::ZoomingCenterY, &keyframes_for(&s.offset.1, fps));
         (smoothing, offset)
     };
+    // Instances that share the manager each point its keyframe provider at their own cache when they render: what
+    // the manager was computed with may be another instance's values even though this instance's didn't change
+    let smoothing_changed = APPLIED_LEVELING.update(stab, &s.horizon_percent) || smoothing_changed;
+    let offset_changed = APPLIED_OFFSET.update(stab, &s.offset) || offset_changed;
     let mut smoothing_changed = smoothing_changed;
     if stab.smoothing.read().current().get_name() != SMOOTHING_METHOD_NONE_NAME {
         stab.set_smoothing_method(SMOOTHING_METHOD_NONE);
@@ -170,6 +179,29 @@ mod tests {
         assert_eq!(s.horizon_percent, vec![0.0, 50.0, 100.0]);
         assert_eq!(s.zoom, vec![1.0, 2.0, 1.0]);
         assert_eq!(s.offset, (vec![0.0, 0.05, -0.25], vec![0.0]));
+    }
+
+    #[test]
+    fn instances_sharing_a_manager_apply_their_own_values_again() {
+        let stab = Arc::new(StabilizationManager::default());
+        stab.params.write().fps = 25.0;
+        let cache = || RwLock::new(KeyframableParams { use_gyroflows_keyframes: false, cached_keyframes: KeyframeManager::default() });
+        let (a, b) = (cache(), cache());
+        let level = |leveling, offset_x| Settings::constant(leveling, false, 4.0, 100.0, offset_x, 0.0);
+        assert!(apply(&stab, &a, &level(100.0, 0.0)));
+        assert!(!apply(&stab, &a, &level(100.0, 0.0)));
+        // Same values from another instance (Resolve's copies of one item) don't compute again
+        assert!(apply(&stab, &b, &level(100.0, 0.0)));
+        assert!(!apply(&stab, &a, &level(100.0, 0.0)));
+        // Another cut's leveling, then this one's again: its own cache didn't change, the manager's did
+        assert!(apply(&stab, &b, &level(50.0, 0.0)));
+        stab.smoothing_invalidated.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(apply(&stab, &a, &level(100.0, 0.0)));
+        assert!(stab.smoothing_invalidated.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(apply(&stab, &b, &level(50.0, 20.0)));
+        stab.zooming_invalidated.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(apply(&stab, &a, &level(100.0, 0.0)));
+        assert!(stab.zooming_invalidated.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

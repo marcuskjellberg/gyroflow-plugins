@@ -3,6 +3,7 @@
 //! The panel has a few user-facing controls; everything else is fixed here so the
 //! result doesn't depend on presets saved by the Gyroflow app.
 
+use std::sync::Arc;
 use gyroflow_plugin_base::*;
 use gyroflow_plugin_base::parking_lot::RwLock;
 
@@ -39,11 +40,16 @@ impl Settings {
     }
 }
 
+/// The settings a manager's stabilization was last computed with, by whichever instance
+static APPLIED: ManagerRecords<Settings> = ManagerRecords::new();
+
 /// Writes the settings into the plugin's keyframe cache (which the core reads through the keyframe
 /// provider) and the core's zoom parameters. Returns true when something changed and the
 /// stabilization is being recomputed.
-pub fn apply(stab: &StabilizationManager, keyframable: &RwLock<KeyframableParams>, s: &Settings) -> bool {
-    let mut changed = false;
+pub fn apply(stab: &Arc<StabilizationManager>, keyframable: &RwLock<KeyframableParams>, s: &Settings) -> bool {
+    // Instances that share the manager each point its keyframe provider at their own cache when they render: what
+    // the manager was computed with may be another instance's values even though this instance's didn't change
+    let mut changed = APPLIED.update(stab, s);
     {
         let mut kp = keyframable.write();
         for (typ, value) in [
@@ -127,13 +133,28 @@ mod tests {
 
     #[test]
     fn unchanged_settings_are_not_applied_again() {
-        let stab = StabilizationManager::default();
+        let stab = Arc::new(StabilizationManager::default());
         let keyframable = RwLock::new(KeyframableParams { use_gyroflows_keyframes: false, cached_keyframes: KeyframeManager::default() });
         let s = Settings::new(85.0, 0.9, 4.0);
         assert!(apply(&stab, &keyframable, &s));
         // Applying again recomputes the stabilization and solves the crop at every rendered frame
         assert!(!apply(&stab, &keyframable, &s));
         assert!(apply(&stab, &keyframable, &Settings::new(50.0, 0.9, 4.0)));
+    }
+
+    #[test]
+    fn instances_sharing_a_manager_apply_their_own_settings_again() {
+        let stab = Arc::new(StabilizationManager::default());
+        let cache = || RwLock::new(KeyframableParams { use_gyroflows_keyframes: false, cached_keyframes: KeyframeManager::default() });
+        let (a, b) = (cache(), cache());
+        let s = Settings::new(85.0, 0.9, 4.0);
+        assert!(apply(&stab, &a, &s));
+        // Same settings from another instance (Resolve's copies of one item) don't compute again
+        assert!(apply(&stab, &b, &s));
+        assert!(!apply(&stab, &a, &s));
+        // Another cut's settings, then this one's again: its own cache didn't change, the manager's did
+        assert!(apply(&stab, &b, &Settings::new(40.0, 0.9, 4.0)));
+        assert!(apply(&stab, &a, &s));
     }
 
 }

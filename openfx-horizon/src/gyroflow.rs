@@ -321,7 +321,9 @@ impl InstanceData {
             String::new()
         } else {
             let divisor = greatest_common_divisor(width, height);
-            format!("aspect:{}:{}", width / divisor, height / divisor)
+            // The cuts of one clip keep the instance ID Resolve copied to them until they're edited: the range keeps
+            // each cut's crop solve and keyframes to itself
+            format!("{}|aspect:{}:{}", range_context(self.item_range), width / divisor, height / divisor)
         };
 
         self.plugin.stab_manager_standalone(&mut self.params, manager_cache, out_size, &cache_context).map_err(|e| e.to_string())
@@ -405,6 +407,19 @@ struct SampledControls {
     zoom: SampledControl,
     offset_x: SampledControl,
     offset_y: SampledControl,
+}
+
+/// The manager cache's context for the source frames of the timeline item rendered, when known
+fn range_context(range: Option<(f64, f64)>) -> String {
+    match range {
+        Some((start, end)) => format!("range:{start:.3}:{end:.3}"),
+        None => "range:none".to_string(),
+    }
+}
+
+/// Controls whose first edit gives the instance its own ID (see `GyroflowPluginBaseInstance::split_instance_id`)
+fn splits_instance_id(name: &str) -> bool {
+    matches!(name, "Leveling" | "CropZoom" | "OffsetX" | "OffsetY" | "StaticCrop" | "CropSmoothness")
 }
 
 fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
@@ -894,6 +909,14 @@ impl Execute for GyroflowPlugin {
 
                 if in_args.get_change_reason()? == Change::UserEdited {
                     log::info!("InstanceChanged {:?}", in_args.get_name()?);
+                    // A bladed clip's cuts start with one copied ID: an edited cut takes its own, so the others don't follow
+                    if splits_instance_id(&in_args.get_name()?) {
+                        match instance_data.plugin.split_instance_id(&mut instance_data.params, &self.gyroflow_plugin.manager_cache) {
+                            Ok(true) => log::info!("Instance ID split off at the first edit"),
+                            Ok(false) => { }
+                            Err(e) => log::error!("Failed to split the instance ID: {e}"),
+                        }
+                    }
                 }
                 // Everything else is applied in Render, where the stabilizer is available
                 if in_args.get_name()? == "RecalculateCrop" {
@@ -1440,5 +1463,15 @@ mod layout_tests {
         assert_eq!(normalize(3840, 2160), normalize(1920, 1080));
         assert_eq!(normalize(1920, 1080), (16, 9));
         assert_ne!(normalize(1920, 1080), normalize(1440, 1080));
+    }
+
+    #[test]
+    fn cuts_of_one_clip_get_their_own_manager_context() {
+        // Two cuts of a bladed clip: same source, same copied instance ID, different source frames
+        assert_ne!(range_context(Some((0.0, 240.0))), range_context(Some((240.0, 600.0))));
+        assert_eq!(range_context(Some((240.0, 600.0))), range_context(Some((240.0, 600.0))));
+        assert_ne!(range_context(None), range_context(Some((0.0, 240.0))));
+        assert!(["Leveling", "CropZoom", "OffsetX", "OffsetY", "StaticCrop", "CropSmoothness"].into_iter().all(splits_instance_id));
+        assert!(!splits_instance_id("ViewMode") && !splits_instance_id("PreviewQuality") && !splits_instance_id("RecalculateCrop"));
     }
 }

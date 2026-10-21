@@ -296,6 +296,9 @@ impl InstanceData {
             String::new()
         } else {
             let divisor = greatest_common_divisor(width, height);
+            // No item range here: the crop is solved over the whole clip, so cuts whose instance ID Resolve copied can
+            // share a manager until one is edited and splits its ID off. What the manager holds is tracked with it
+            // (`crop::CropState::ensure`, `simple::apply`), so a cut never renders another's crop or settings
             format!("aspect:{}:{}", width / divisor, height / divisor)
         };
 
@@ -334,6 +337,11 @@ impl RenderStats {
             *self = Self { layout: std::mem::take(&mut self.layout), ..Default::default() };
         }
     }
+}
+
+/// Controls whose first edit gives the instance its own ID (see `GyroflowPluginBaseInstance::split_instance_id`)
+fn splits_instance_id(name: &str) -> bool {
+    matches!(name, "Stabilization" | "HorizonLevel" | "Flip180" | "PositionX" | "PositionY" | "ZoomResponse")
 }
 
 fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
@@ -783,6 +791,14 @@ impl Execute for GyroflowPlugin {
 
                 if in_args.get_change_reason()? == Change::UserEdited {
                     log::info!("InstanceChanged {:?}", in_args.get_name()?);
+                    // A bladed clip's cuts start with one copied ID: an edited cut takes its own, so the others don't follow
+                    if splits_instance_id(&in_args.get_name()?) {
+                        match instance_data.plugin.split_instance_id(&mut instance_data.params, &self.gyroflow_plugin.manager_cache) {
+                            Ok(true) => log::info!("Instance ID split off at the first edit"),
+                            Ok(false) => { }
+                            Err(e) => log::error!("Failed to split the instance ID: {e}"),
+                        }
+                    }
                 }
                 match in_args.get_name()?.as_str() {
                     "Flip180" => {
@@ -1149,6 +1165,37 @@ mod layout_tests {
             println!("{path}: {label}: peak zoom {:.1}%, closest sample {closest:.2} px inside the margin, {} of {} bounds lowered by the render check (up to {:.2} px), solved in {:.0} ms",
                 100.0 / tightest, report.corrected, report.fovs.len(), report.overshoot, report.elapsed_ms);
         }
+    }
+
+    #[test]
+    fn cuts_sharing_a_manager_dont_render_each_others_crop() {
+        // Cuts of one clip whose instance ID Resolve copied share a manager until one is edited. A manager with no
+        // video solves as a still camera, so the crop is the zoom alone
+        let stab = Arc::new(StabilizationManager::default());
+        {
+            let mut params = stab.params.write();
+            params.size = (400, 300);
+            params.output_size = (400, 225);
+            params.fps = 25.0;
+            params.frame_count = 50;
+            params.duration_ms = 2000.0;
+        }
+        stab.init_size();
+        let request = |zoom: f64| gyroflow_plugin_base::crop::CropRequest { frames: (0, 49), zoom: vec![zoom], ..Default::default() };
+        let rendered_fov = || stab.params.read().fovs[10];
+        let (mut a, mut b) = (gyroflow_plugin_base::crop::CropState::default(), gyroflow_plugin_base::crop::CropState::default());
+
+        assert!(a.ensure(&stab, request(1.0), 10).is_some());
+        assert!(b.ensure(&stab, request(2.0), 10).is_some());
+        let zoomed = rendered_fov();
+        let wide = a.ensure(&stab, request(1.0), 10).map(|r| r.fovs[10]).expect("the manager holds the other cut's crop: solved again");
+        assert!((rendered_fov() - wide).abs() < 1e-9);
+        assert!((wide / zoomed - 2.0).abs() < 1e-3, "the other cut's zoom doesn't spill: {wide} vs {zoomed}");
+        // After A solved again, B renders its own zoom again, not A's
+        assert!(b.ensure(&stab, request(2.0), 10).is_some());
+        assert!((rendered_fov() - zoomed).abs() < 1e-9);
+        // And the cut that solved last isn't solved again
+        assert!(b.ensure(&stab, request(2.0), 10).is_none());
     }
 
     #[test]

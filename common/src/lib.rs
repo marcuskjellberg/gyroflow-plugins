@@ -511,6 +511,17 @@ impl GyroflowPluginBaseInstance {
         }
     }
 
+    /// Gives the instance an ID of its own, and so managers of its own, at its first edit. Hosts copy the hidden ID
+    /// along with the effect (Resolve to every cut of a bladed clip), and instances with one ID share managers.
+    /// Returns true when it did
+    pub fn split_instance_id(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>) -> PluginResult<bool> {
+        if self.ever_changed { return Ok(false); }
+        self.ever_changed = true;
+        params.set_string(Params::InstanceId, &format!("{}", fastrand::u64(..)))?;
+        self.clear_stab(manager_cache);
+        Ok(true)
+    }
+
     pub fn set_keyframe_provider(&self, stab: &StabilizationManager) {
         let kparams = self.keyframable_params.clone();
         stab.keyframes.write().set_custom_provider(move |kf, typ, timestamp_ms| -> Option<f64> {
@@ -606,7 +617,15 @@ impl GyroflowPluginBaseInstance {
 
         let context = if standalone { format!("standalone:{cache_context}") } else { cache_context.to_owned() };
         let key = manager_cache_key(&path, disable_stretch, &instance_id, &context);
-        let cloned = manager_cache.lock().get(&key).map(Arc::clone);
+        let mut cloned = manager_cache.lock().get(&key).map(Arc::clone);
+        if cloned.is_none() {
+            // Evicted from the global cache (it holds 8, and each cut of a clip can have its own) while this
+            // instance still holds it: loading it again would read the whole file's telemetry
+            if let Some(stab) = self.managers.get(&key).map(Arc::clone) {
+                manager_cache.lock().put(key.to_owned(), stab.clone());
+                cloned = Some(stab);
+            }
+        }
         let stab = if let Some(stab) = cloned {
             // Cache it in this instance as well
             if !self.managers.contains(&key) {
@@ -1076,11 +1095,7 @@ impl GyroflowPluginBaseInstance {
                 Params::UseGyroflowsKeyframes | Params::RecalculateKeyframes => {
 
                     params.set_string(Params::Status, "Calculating...")?;
-                    if !self.ever_changed {
-                        self.ever_changed = true;
-                        params.set_string(Params::InstanceId, &format!("{}", fastrand::u64(..)))?;
-                        self.clear_stab(manager_cache);
-                    }
+                    self.split_instance_id(params, manager_cache)?;
                     let use_gyroflows_keyframes = params.get_bool(Params::UseGyroflowsKeyframes).unwrap_or_default();
                     self.cache_keyframes(params, use_gyroflows_keyframes, self.num_frames, self.fps.max(1.0));
                     for (_, v) in self.managers.iter_mut() {
@@ -1132,6 +1147,49 @@ impl GyroflowPluginBaseInstance {
         }
 
         Ok(())
+    }
+}
+
+/// A value per stabilization manager, whichever plugin instance wrote it. Instances can share a manager (cuts of one
+/// clip whose hidden instance ID Resolve copied, Resolve's internal copies of one item), so state that describes
+/// what's in the manager has to live with the manager, not with the instance.
+pub struct ManagerRecords<T> {
+    /// Managers held weakly, so no other manager can take an address while it's compared against
+    entries: std::sync::Mutex<Vec<(std::sync::Weak<StabilizationManager>, T)>>,
+}
+
+impl<T: Clone + PartialEq> ManagerRecords<T> {
+    pub const fn new() -> Self {
+        Self { entries: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(std::sync::Weak<StabilizationManager>, T)>> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        // A manager that's gone can't be rendered with again, and its address may be reused
+        entries.retain(|(manager, _)| manager.strong_count() > 0);
+        entries
+    }
+
+    pub fn get(&self, stab: &Arc<StabilizationManager>) -> Option<T> {
+        self.lock().iter().find(|(manager, _)| std::ptr::eq(manager.as_ptr(), Arc::as_ptr(stab))).map(|(_, value)| value.clone())
+    }
+
+    pub fn set(&self, stab: &Arc<StabilizationManager>, value: T) {
+        let mut entries = self.lock();
+        match entries.iter_mut().find(|(manager, _)| std::ptr::eq(manager.as_ptr(), Arc::as_ptr(stab))) {
+            Some(entry) => entry.1 = value,
+            None => entries.push((Arc::downgrade(stab), value)),
+        }
+    }
+
+    /// Records `value` for the manager. Returns true when it held another value, or none
+    pub fn update(&self, stab: &Arc<StabilizationManager>, value: &T) -> bool {
+        let mut entries = self.lock();
+        match entries.iter_mut().find(|(manager, _)| std::ptr::eq(manager.as_ptr(), Arc::as_ptr(stab))) {
+            Some(entry) if entry.1 == *value => false,
+            Some(entry) => { entry.1 = value.clone(); true }
+            None => { entries.push((Arc::downgrade(stab), value.clone())); true }
+        }
     }
 }
 
@@ -1378,5 +1436,20 @@ mod tests {
             manager_cache_key("ab", false, "c", ""),
             manager_cache_key("a", false, "bc", "")
         );
+    }
+
+    #[test]
+    fn manager_records_follow_the_manager_not_the_writer() {
+        static RECORDS: ManagerRecords<u32> = ManagerRecords::new();
+        let a = Arc::new(StabilizationManager::default());
+        let b = Arc::new(StabilizationManager::default());
+        assert!(RECORDS.update(&a, &1));
+        assert!(!RECORDS.update(&a, &1));
+        assert!(RECORDS.update(&a, &2), "another writer's value replaces it");
+        assert_eq!((RECORDS.get(&a), RECORDS.get(&b)), (Some(2), None));
+        RECORDS.set(&b, 3);
+        assert_eq!(RECORDS.get(&b), Some(3));
+        drop(a);
+        assert_eq!(RECORDS.lock().len(), 1, "a manager that's gone is forgotten");
     }
 }

@@ -108,9 +108,24 @@ The Render-action time math is a pure, unit-tested function (`compute_timestamp`
 ## Manager cache semantics (common/src/lib.rs `stab_manager`)
 
 - The base cache key contains length-delimited project path, disable-stretch state, and
-  instance ID. Resolve Edit/Color adds the accepted trim and reduced output aspect ratio.
-  Cuts with different visible ranges therefore cannot overwrite each other's adaptive-zoom
-  solve, while full/half/quarter-resolution buffers with the same aspect can still share.
+  instance ID. On Resolve Edit/Color each plugin adds context: `openfx` the accepted trim
+  (`trim:…`) and reduced output aspect, Horizon Leveling the timeline item's source range
+  (`range:{start}:{end}`, `range:none` until the scripting query answers) and aspect,
+  Gyroflow Simple only the aspect (it solves over the whole clip). Full/half/quarter-
+  resolution buffers with the same aspect share a manager.
+- **The instance ID is not per cut.** Blading a clip copies the effect, hidden `InstanceId`
+  included, to every piece, so cuts share managers unless the context tells them apart.
+  Each plugin gives an instance a fresh ID at its first user edit of a control that changes
+  the result (`GyroflowPluginBaseInstance::split_instance_id`; `openfx` via `param_changed`,
+  Horizon/Simple from `InstanceChanged`). Don't key on the OFX instance handle instead:
+  Resolve's internal copies of one item (playback, filmstrip, …) would then each solve.
+- **State describing a shared manager lives with the manager** (`ManagerRecords` in
+  `common/src/lib.rs`), not the instance: the last crop request solved
+  (`crop::CropState::ensure`) and the settings last applied through the keyframe provider
+  (`settings::apply`, `simple::apply`). Each instance re-installs the keyframe provider
+  pointing at its own cache on every `stab_manager` call, so a per-instance "did my values
+  change" check would render another cut's crop/leveling. Ranges of one item that differ by
+  ≤3 frames merge instead of taking turns re-solving.
 - `invalidate_blocking_smoothing()` only sets flags; the recompute happens inside the
   next `process_pixels` (visible in logs as `Max zoom iteration …` right after
   `Setting trim range …`).
