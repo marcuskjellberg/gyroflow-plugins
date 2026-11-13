@@ -775,6 +775,9 @@ impl GyroflowPluginBaseInstance {
                 // scales it to the largest crop that fits within the source (rotation-aware),
                 // so the result is independent of reduced-resolution (proxy) buffer sizes.
                 stab.set_output_size(out_size.0 as _, out_size.1 as _);
+                // The output covers the whole host frame, so it must be opaque there too —
+                // a transparent background would read as empty to effects after this one
+                stab.set_background_color(nalgebra::Vector4::new(0.0, 0.0, 0.0, 1.0));
             }
 
             let loaded = {
@@ -918,6 +921,7 @@ impl GyroflowPluginBaseInstance {
                 // Ignore the OutputWidth/OutputHeight params (disabled on these pages, and
                 // possibly stale from older sessions) — always fill the host frame's aspect
                 stab.set_output_size(out_size.0 as _, out_size.1 as _);
+                stab.set_background_color(nalgebra::Vector4::new(0.0, 0.0, 0.0, 1.0));
             } else {
                 stab.set_output_size(params.get_f64(Params::OutputWidth)? as _, params.get_f64(Params::OutputHeight)? as _);
             }

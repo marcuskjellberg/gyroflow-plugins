@@ -674,12 +674,23 @@ impl Execute for GyroflowPlugin {
                 let instance_data = effect.get_instance_data::<InstanceData>()?;
                 let rod = instance_data.source_clip.get_region_of_definition(time)?;
                 if !instance_data.supports_output_size {
-                    // Resolve Edit/Color pages: buffers are always timeline-sized and Resolve
-                    // doesn't consult this action in practice (verified with logging) — the
-                    // output fills the frame with a timeline-aspect crop of the source, so
-                    // just pass the host-reported RoD through
-                    log::debug!("GetRegionOfDefinition: time: {time}, source rod: {:?}", (rod.x1, rod.y1, rod.x2, rod.y2));
-                    out_args.set_effect_region_of_definition(rod)?;
+                    // Resolve Edit/Color pages: buffers are always timeline-sized and the output
+                    // fills the whole frame with a timeline-aspect crop of the source. A source
+                    // that doesn't match the timeline aspect only defines a pillar/letterboxed
+                    // band, so passing its RoD through makes downstream effects (eg. AI CineFocus)
+                    // treat the filled sides as empty. Declare the full project frame instead.
+                    let props: EffectInstance = effect.properties()?;
+                    let mut out_rod = rod;
+                    if let (Ok(offset), Ok(extent)) = (props.get_project_offset(), props.get_project_extent()) {
+                        if extent.x > offset.x && extent.y > offset.y {
+                            out_rod.x1 = offset.x;
+                            out_rod.y1 = offset.y;
+                            out_rod.x2 = extent.x;
+                            out_rod.y2 = extent.y;
+                        }
+                    }
+                    log::info!("GetRegionOfDefinition: time: {time}, source rod: {:?}, output rod: {:?}", (rod.x1, rod.y1, rod.x2, rod.y2), (out_rod.x1, out_rod.y1, out_rod.x2, out_rod.y2));
+                    out_args.set_effect_region_of_definition(out_rod)?;
                     return OK;
                 }
                 let mut out_rod = rod;
